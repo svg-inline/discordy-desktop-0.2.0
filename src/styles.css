@@ -1186,3 +1186,64 @@ body {
   from { opacity: .35; transform: scale(.75); }
   to { opacity: 1; transform: scale(1.15); }
 }
+
+/* 0.11.0 — GitHub Releases / Auto Update */
+.update-banner {
+  position: fixed;
+  z-index: 2500;
+  top: 12px;
+  left: 50%;
+  width: min(620px, calc(100vw - 28px));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 11px 12px;
+  border: 1px solid rgba(255, 255, 255, .12);
+  border-radius: 10px;
+  background: rgba(20, 23, 31, .96);
+  box-shadow: 0 16px 45px rgba(0, 0, 0, .38);
+  transform: translateX(-50%);
+  backdrop-filter: blur(14px);
+}
+.update-banner--available,
+.update-banner--downloaded { border-color: rgba(88, 101, 242, .55); }
+.update-banner--error { border-color: rgba(237, 66, 69, .55); }
+.update-banner__body { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.update-banner__body strong { color: var(--text-primary); font-size: 11px; }
+.update-banner__body > span { overflow: hidden; color: var(--text-secondary); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.update-banner__actions { flex: 0 0 auto; display: flex; gap: 7px; }
+.update-banner__actions .button { min-height: 30px; padding: 0 11px; font-size: 9px; }
+.update-progress { height: 4px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: rgba(255, 255, 255, .08); }
+.update-progress > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width .18s ease; }
+.update-check-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 9px;
+  cursor: pointer;
+}
+.update-check-button:hover:not(:disabled) { color: var(--text-primary); text-decoration: underline; }
+.update-check-button:disabled { opacity: .5; cursor: default; }
+.desktop-update-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 2px;
+  padding: 9px 0 1px;
+  border-top: 1px solid rgba(255, 255, 255, .06);
+}
+.desktop-update-status > div { min-width: 0; display: grid; gap: 2px; }
+.desktop-update-status strong { font-size: 10px; }
+.desktop-update-status small { color: var(--text-muted); font-size: 8px; line-height: 1.4; }
+.desktop-update-status .button { flex: 0 0 auto; min-height: 28px; padding: 0 9px; font-size: 8px; }
+
+@media (max-width: 680px) {
+  .update-banner { align-items: stretch; flex-direction: column; }
+  .update-banner__actions .button { width: 100%; }
+  .welcome-card__footer { flex-wrap: wrap; }
+  .desktop-update-status { align-items: stretch; flex-direction: column; }
+}

@@ -47,6 +47,13 @@ const api = {
   clipboard: Object.freeze({
     writeText: (text) => ipcRenderer.invoke('clipboard:write-text', safeString(text, MAX_TEXT)),
   }),
+  updates: Object.freeze({
+    getState: () => ipcRenderer.invoke('updates:get-state'),
+    check: () => ipcRenderer.invoke('updates:check'),
+    download: () => ipcRenderer.invoke('updates:download'),
+    install: () => ipcRenderer.invoke('updates:install'),
+    onState: (callback) => subscribe('updates:state', callback),
+  }),
   desktop: Object.freeze({
     getState: () => ipcRenderer.invoke('desktop:get-state'),
     updatePreferences: (changes = {}) => ipcRenderer.invoke('desktop:update-preferences', {

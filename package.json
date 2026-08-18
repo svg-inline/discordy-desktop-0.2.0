@@ -1,9 +1,9 @@
 {
   "name": "discordy-desktop",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "private": true,
   "type": "module",
-  "description": "Discordy Desktop - Media stall recovery: screen-share watchdog, stale-track cleanup e recuperação escalonada de vídeo congelado",
+  "description": "Discordy Desktop - GitHub Releases, auto-update NSIS e distribuição Windows automatizada",
   "main": "electron/main.mjs",
   "author": "Discordy",
   "license": "UNLICENSED",
@@ -13,12 +13,15 @@
     "start": "npm run build && electron .",
     "dist:win": "npm run build && electron-builder --win nsis portable",
     "typecheck": "tsc --noEmit",
-    "test:security": "node server/security.test.mjs"
+    "test:security": "node server/security.test.mjs",
+    "release:validate": "node scripts/validate-release.mjs",
+    "release:win": "npm run release:validate && npm run build && electron-builder --config electron-builder.release.cjs --win nsis portable --publish always"
   },
   "dependencies": {
     "react": "19.1.1",
     "react-dom": "19.1.1",
-    "ws": "8.18.3"
+    "ws": "8.18.3",
+    "electron-updater": "6.8.9"
   },
   "devDependencies": {
     "@types/react": "19.1.10",
@@ -58,14 +61,14 @@
       "target": [
         "nsis",
         "portable"
-      ],
-      "artifactName": "Discordy-${version}-${arch}.${ext}"
+      ]
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "artifactName": "Discordy-Setup-${version}-${arch}.${ext}"
     },
     "directories": {
       "output": "release"
@@ -73,6 +76,9 @@
     "asarUnpack": [
       "electron/global-key-monitor.ps1",
       "assets/tray.png"
-    ]
+    ],
+    "portable": {
+      "artifactName": "Discordy-Portable-${version}-${arch}.${ext}"
+    }
   }
 }

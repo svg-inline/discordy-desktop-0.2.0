@@ -54,6 +54,18 @@ let shortcutStatus = {
   holdKeys: false,
 };
 
+let updaterInstance = null;
+let updateState = {
+  supported: false,
+  status: 'unsupported',
+  currentVersion: app.getVersion(),
+  availableVersion: null,
+  progress: null,
+  message: 'Atualizações automáticas disponíveis somente no instalador NSIS.',
+  error: null,
+  portable: Boolean(process.env.PORTABLE_EXECUTABLE_FILE),
+};
+
 function sendToRenderer(channel, payload) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.webContents.send(channel, payload);
@@ -440,6 +452,131 @@ app.on('open-url', (event, url) => {
   deliverDeepLink(url);
 });
 
+
+function publishUpdateState(patch = {}) {
+  updateState = {
+    ...updateState,
+    ...patch,
+    currentVersion: app.getVersion(),
+    portable: Boolean(process.env.PORTABLE_EXECUTABLE_FILE),
+  };
+  sendToRenderer('updates:state', updateState);
+  return { ...updateState };
+}
+
+function updaterErrorMessage(cause) {
+  const raw = cause instanceof Error ? cause.message : String(cause || 'Erro desconhecido.');
+  return raw.replace(/\s+/g, ' ').trim().slice(0, 500);
+}
+
+async function checkForApplicationUpdates() {
+  if (!updateState.supported || !updaterInstance) return { ...updateState };
+  if (updateState.status === 'checking' || updateState.status === 'downloading') return { ...updateState };
+  publishUpdateState({ status: 'checking', progress: null, message: 'Verificando atualizações...', error: null });
+  try {
+    await updaterInstance.checkForUpdates();
+  } catch (cause) {
+    publishUpdateState({ status: 'error', message: 'Não foi possível verificar atualizações.', error: updaterErrorMessage(cause) });
+  }
+  return { ...updateState };
+}
+
+async function downloadApplicationUpdate() {
+  if (!updateState.supported || !updaterInstance) return { ...updateState };
+  if (updateState.status === 'downloading' || updateState.status === 'downloaded') return { ...updateState };
+  if (updateState.status !== 'available') {
+    await checkForApplicationUpdates();
+    if (updateState.status !== 'available') return { ...updateState };
+  }
+  publishUpdateState({ status: 'downloading', progress: 0, message: 'Baixando atualização...', error: null });
+  try {
+    await updaterInstance.downloadUpdate();
+  } catch (cause) {
+    publishUpdateState({ status: 'error', message: 'Falha ao baixar a atualização.', error: updaterErrorMessage(cause) });
+  }
+  return { ...updateState };
+}
+
+async function installDownloadedApplicationUpdate() {
+  if (!updateState.supported || !updaterInstance || updateState.status !== 'downloaded') return false;
+  isQuitting = true;
+  try { await hostService.stop(); } catch { /* noop */ }
+  setTimeout(() => {
+    try {
+      // electron-updater 6.x uses positional arguments: isSilent, isForceRunAfter.
+      updaterInstance.quitAndInstall(false, true);
+    } catch (cause) {
+      isQuitting = false;
+      publishUpdateState({ status: 'error', message: 'Falha ao iniciar o instalador da atualização.', error: updaterErrorMessage(cause) });
+    }
+  }, 150);
+  return true;
+}
+
+async function initializeAutoUpdater() {
+  if (process.platform !== 'win32') {
+    publishUpdateState({ supported: false, status: 'unsupported', message: 'Auto-update está habilitado somente no Windows nesta versão.', error: null });
+    return;
+  }
+  if (!app.isPackaged) {
+    publishUpdateState({ supported: false, status: 'unsupported', message: 'Auto-update é desativado durante o desenvolvimento.', error: null });
+    return;
+  }
+  if (process.env.PORTABLE_EXECUTABLE_FILE) {
+    publishUpdateState({ supported: false, status: 'unsupported', message: 'A edição Portable não instala updates automaticamente. Use o Discordy Setup.', error: null });
+    return;
+  }
+  const updateConfigPath = join(process.resourcesPath, 'app-update.yml');
+  if (!existsSync(updateConfigPath)) {
+    publishUpdateState({ supported: false, status: 'unsupported', message: 'Este build não possui configuração de release. Publique pelo workflow do GitHub.', error: null });
+    return;
+  }
+
+  try {
+    const updaterModule = await import('electron-updater');
+    updaterInstance = updaterModule.autoUpdater ?? updaterModule.default?.autoUpdater ?? null;
+    if (!updaterInstance) throw new Error('electron-updater não disponibilizou autoUpdater.');
+
+    updaterInstance.autoDownload = false;
+    updaterInstance.autoInstallOnAppQuit = false;
+    updaterInstance.allowPrerelease = false;
+    updaterInstance.logger = console;
+
+    updaterInstance.on('checking-for-update', () => {
+      publishUpdateState({ status: 'checking', progress: null, message: 'Verificando atualizações...', error: null });
+    });
+    updaterInstance.on('update-available', (info) => {
+      publishUpdateState({ status: 'available', availableVersion: String(info?.version || ''), progress: 0, message: `Discordy ${info?.version || ''} disponível.`, error: null });
+      showNativeNotification({ title: 'Atualização do Discordy', body: `A versão ${info?.version || 'mais recente'} está disponível.`, silent: true });
+    });
+    updaterInstance.on('update-not-available', () => {
+      publishUpdateState({ status: 'idle', availableVersion: null, progress: null, message: 'Discordy está atualizado.', error: null });
+    });
+    updaterInstance.on('download-progress', (progress) => {
+      const percent = Number(progress?.percent);
+      publishUpdateState({
+        status: 'downloading',
+        progress: Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) : null,
+        message: 'Baixando atualização...',
+        error: null,
+      });
+    });
+    updaterInstance.on('update-downloaded', (info) => {
+      publishUpdateState({ status: 'downloaded', availableVersion: String(info?.version || updateState.availableVersion || ''), progress: 100, message: 'Atualização pronta para instalar.', error: null });
+      showNativeNotification({ title: 'Discordy atualizado', body: 'A nova versão foi baixada. Reinicie para instalar.', silent: true });
+    });
+    updaterInstance.on('error', (cause) => {
+      publishUpdateState({ status: 'error', message: 'Erro no sistema de atualização.', error: updaterErrorMessage(cause) });
+    });
+
+    publishUpdateState({ supported: true, status: 'idle', message: 'Atualizações via GitHub Releases ativas.', error: null });
+    setTimeout(() => void checkForApplicationUpdates(), 4500);
+  } catch (cause) {
+    updaterInstance = null;
+    publishUpdateState({ supported: false, status: 'error', message: 'O módulo de atualização não pôde ser inicializado.', error: updaterErrorMessage(cause) });
+  }
+}
+
 function configureMediaPermissions() {
   const ses = session.defaultSession;
   ses.setPermissionCheckHandler((webContents, permission) => {
@@ -535,6 +672,7 @@ function createWindow(forceShow = false) {
 
   mainWindow.webContents.on('did-finish-load', () => {
     mainWindow?.webContents.send('desktop:preferences-changed', getDesktopRuntimeState());
+    mainWindow?.webContents.send('updates:state', updateState);
     if (pendingDeepLink) {
       mainWindow?.webContents.send('app:deep-link', pendingDeepLink);
       pendingDeepLink = null;
@@ -634,6 +772,24 @@ ipcMain.on('desktop:update-media-state', (event, state = {}) => {
   rebuildTrayMenu();
 });
 
+
+ipcMain.handle('updates:get-state', (event) => {
+  assertTrustedIpc(event);
+  return { ...updateState };
+});
+ipcMain.handle('updates:check', async (event) => {
+  assertTrustedIpc(event);
+  return await checkForApplicationUpdates();
+});
+ipcMain.handle('updates:download', async (event) => {
+  assertTrustedIpc(event);
+  return await downloadApplicationUpdate();
+});
+ipcMain.handle('updates:install', async (event) => {
+  assertTrustedIpc(event);
+  return await installDownloadedApplicationUpdate();
+});
+
 app.on('web-contents-created', (_event, contents) => {
   contents.setWindowOpenHandler(({ url }) => {
     if (mainWindow && contents.id === mainWindow.webContents.id) void openExternalSafe(url);
@@ -653,6 +809,7 @@ if (gotLock) {
     createTray();
     createWindow();
     configureGlobalShortcuts();
+    void initializeAutoUpdater();
     deliverDeepLink(extractDeepLink(process.argv));
 
     app.on('activate', () => {

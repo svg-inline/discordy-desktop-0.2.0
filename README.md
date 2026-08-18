@@ -1,4 +1,47 @@
-# Discordy Desktop 0.10.0 — Segurança
+# Discordy Desktop 0.11.0 — GitHub Releases e Auto-Update
+
+Evolução da `0.10.x` com distribuição Windows versionada, GitHub Releases e atualização integrada ao Electron. A arquitetura de sala, signaling e WebRTC permanece independente do canal de atualização.
+
+## 0.11.0 — Update & Release
+
+Implementado:
+
+- `electron-updater` no processo principal do Electron;
+- update automático suportado somente para instalação NSIS;
+- Portable mantido como artefato separado com update manual;
+- verificação automática após iniciar o app;
+- verificação manual na home e em Configurações;
+- estado `checking / available / downloading / downloaded / error`;
+- progresso de download na interface;
+- instalação explícita por `Reiniciar e atualizar`;
+- IPC restrito para updater, protegido por `assertTrustedIpc`;
+- `latest.yml` / `.blockmap` gerados pelo release NSIS;
+- nomes distintos para `Setup` e `Portable`, sem colisão de `.exe`;
+- validação `tag GitHub ↔ package.json`;
+- GitHub Actions para build Windows e publicação da Release ao enviar uma tag `v*`;
+- build manual pelo `workflow_dispatch`;
+- configuração GitHub gerada em release sem hardcode de owner/repo;
+- documentação operacional em [`RELEASE-GITHUB.md`](./RELEASE-GITHUB.md).
+
+### Fluxo de release
+
+```text
+package.json 0.11.1
+      +
+tag v0.11.1
+      ↓
+GitHub Actions
+      ↓
+Setup NSIS + blockmap + latest.yml + Portable
+      ↓
+GitHub Release
+      ↓
+Discordy instalado detecta a nova versão
+```
+
+---
+
+## Histórico — Discordy Desktop 0.10.0 — Segurança
 
 Evolução da `0.9.0` com hardening do signaling, convites, identidade dos peers e superfície privilegiada do Electron, sem alterar a arquitetura Mesh P2P.
 

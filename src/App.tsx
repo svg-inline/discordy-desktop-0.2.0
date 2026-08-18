@@ -16,7 +16,7 @@ import { SCREEN_QUALITY_PRESETS, ScreenShareController } from './media/ScreenSha
 import type { ScreenQualityPreset, ScreenSourceInfo } from './media/ScreenShareController';
 
 const DEFAULT_MAX_PARTICIPANTS = 4;
-const APP_VERSION = '0.10.0';
+const APP_VERSION = '0.11.0';
 
 type HomeMode = 'home' | 'host' | 'join';
 type ThemeMode = 'dark' | 'onyx';
@@ -42,6 +42,17 @@ type DesktopRuntimeState = {
     holdKeys: boolean;
   };
   windowVisible: boolean;
+};
+
+type UpdateRuntimeState = {
+  supported: boolean;
+  status: 'unsupported' | 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error';
+  currentVersion: string;
+  availableVersion: string | null;
+  progress: number | null;
+  message: string;
+  error: string | null;
+  portable: boolean;
 };
 
 type HostState = {
@@ -154,6 +165,47 @@ function inviteExpiryLabel(expiresAt: number | null | undefined) {
   return `Expira em ${Math.ceil(hours / 24)} dia(s)`;
 }
 
+function UpdateBanner({
+  state,
+  onCheck,
+  onDownload,
+  onInstall,
+}: {
+  state: UpdateRuntimeState | null;
+  onCheck: () => void;
+  onDownload: () => void;
+  onInstall: () => void;
+}) {
+  if (!state || state.status === 'idle' || state.status === 'unsupported') return null;
+  const version = state.availableVersion ? ` ${state.availableVersion}` : '';
+  const progress = state.progress === null ? null : Math.max(0, Math.min(100, state.progress));
+
+  return (
+    <aside className={`update-banner update-banner--${state.status}`} role="status" aria-live="polite">
+      <div className="update-banner__body">
+        <strong>
+          {state.status === 'checking' && 'Verificando atualizações'}
+          {state.status === 'available' && `Discordy${version} disponível`}
+          {state.status === 'downloading' && `Baixando Discordy${version}`}
+          {state.status === 'downloaded' && `Discordy${version} pronto para instalar`}
+          {state.status === 'error' && 'Falha na atualização'}
+        </strong>
+        <span>{state.error || state.message}</span>
+        {state.status === 'downloading' && progress !== null && (
+          <div className="update-progress" aria-label={`Download ${Math.round(progress)}%`}>
+            <span style={{ width: `${progress}%` }} />
+          </div>
+        )}
+      </div>
+      <div className="update-banner__actions">
+        {state.status === 'available' && <button className="button button--primary" onClick={onDownload}>Baixar</button>}
+        {state.status === 'downloaded' && <button className="button button--primary" onClick={onInstall}>Reiniciar e atualizar</button>}
+        {state.status === 'error' && <button className="button" onClick={onCheck}>Tentar novamente</button>}
+      </div>
+    </aside>
+  );
+}
+
 function createChatMessageId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -262,6 +314,7 @@ function App() {
   const [chatReadyPeers, setChatReadyPeers] = useState<Record<string, boolean>>({});
   const [chatUnread, setChatUnread] = useState(0);
   const [desktopRuntime, setDesktopRuntime] = useState<DesktopRuntimeState | null>(null);
+  const [updateState, setUpdateState] = useState<UpdateRuntimeState | null>(null);
 
   const signalingRef = useRef<SignalingClient | null>(null);
   const peerManagerRef = useRef<PeerManager | null>(null);
@@ -1172,6 +1225,18 @@ function App() {
     }
   };
 
+  const checkForUpdates = useCallback(async () => {
+    try { setUpdateState(await window.discordy.updates.check()); } catch { /* updater publica o erro */ }
+  }, []);
+
+  const downloadUpdate = useCallback(async () => {
+    try { setUpdateState(await window.discordy.updates.download()); } catch { /* updater publica o erro */ }
+  }, []);
+
+  const installUpdate = useCallback(async () => {
+    try { await window.discordy.updates.install(); } catch { /* updater publica o erro */ }
+  }, []);
+
   const updateDesktopPreference = useCallback(async <K extends keyof DesktopPreferences>(key: K, value: DesktopPreferences[K]) => {
     try {
       const next = await window.discordy.desktop.updatePreferences({ [key]: value });
@@ -1263,6 +1328,18 @@ function App() {
       if (!(desktopRuntime?.preferences.globalShortcuts && desktopRuntime.shortcuts.holdKeys)) releaseShortcuts();
     };
   }, [deafened, desktopRuntime?.preferences.globalShortcuts, desktopRuntime?.shortcuts.holdKeys, inputMode, micEnabled, pushToMuteEnabled, roomId]);
+
+  useEffect(() => {
+    let active = true;
+    void window.discordy.updates.getState()
+      .then((state) => { if (active) setUpdateState(state); })
+      .catch(() => undefined);
+    const unsubscribe = window.discordy.updates.onState((state) => setUpdateState(state));
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1381,6 +1458,7 @@ function App() {
 
     return (
       <main className={rootClassName}>
+        <UpdateBanner state={updateState} onCheck={() => void checkForUpdates()} onDownload={() => void downloadUpdate()} onInstall={() => void installUpdate()} />
         <div className="discord-shell">
           <aside className="server-rail" aria-label="Navegação de salas">
             <button className="rail-button rail-button--brand" title="Discordy" aria-label="Discordy"><span>D</span></button>
@@ -1676,6 +1754,12 @@ function App() {
                           <div><kbd>M</kbd><small>Push-to-Mute pressionar/soltar</small></div>
                         </div>
                         <small className="desktop-runtime-note">Atalhos: mute {desktopRuntime.shortcuts.mute ? '✓' : '×'} · deafen {desktopRuntime.shortcuts.deafen ? '✓' : '×'} · janela {desktopRuntime.shortcuts.toggleWindow ? '✓' : '×'} · PTT global {desktopRuntime.shortcuts.holdKeys ? '✓' : desktopRuntime.globalHoldSupported ? '×' : 'n/d'}</small>
+                        {updateState && (
+                          <div className="desktop-update-status">
+                            <div><strong>Atualizações</strong><small>Versão instalada: {updateState.currentVersion}. {updateState.message}</small></div>
+                            <button className="button" disabled={!updateState.supported || updateState.status === 'checking' || updateState.status === 'downloading'} onClick={() => void checkForUpdates()}>Verificar agora</button>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -1955,6 +2039,7 @@ function App() {
 
   return (
     <main className={rootClassName}>
+      <UpdateBanner state={updateState} onCheck={() => void checkForUpdates()} onDownload={() => void downloadUpdate()} onInstall={() => void installUpdate()} />
       <div className="welcome-shell">
         <aside className="server-rail server-rail--welcome">
           <button className="rail-button rail-button--brand rail-button--active" title="Discordy" aria-label="Discordy"><span>D</span></button>
@@ -1981,7 +2066,7 @@ function App() {
             <section className="welcome-card">
               <div className="welcome-card__intro">
                 <div className="welcome-logo">D</div>
-                <p className="eyebrow">Discordy Desktop 0.10.0</p>
+                <p className="eyebrow">Discordy Desktop {updateState?.currentVersion || APP_VERSION}</p>
                 <h1>Sua sala privada, direto entre os participantes.</h1>
                 <p>WebRTC P2P para voz e compartilhamento de tela, com signaling hospedado pelo próprio host.</p>
               </div>
@@ -2047,6 +2132,9 @@ function App() {
               <div className="welcome-card__footer">
                 <span><span className="connection-dot" />WebRTC Mesh</span>
                 <span>Até {DEFAULT_MAX_PARTICIPANTS} participantes</span>
+                <button className="update-check-button" disabled={!updateState?.supported || updateState.status === 'checking' || updateState.status === 'downloading'} onClick={() => void checkForUpdates()}>
+                  {updateState?.status === 'checking' ? 'Verificando...' : updateState?.portable ? 'Portable: update manual' : 'Verificar atualização'}
+                </button>
               </div>
             </section>
           </div>

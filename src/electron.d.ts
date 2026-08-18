@@ -74,6 +74,18 @@ type DesktopCommand = {
   at: number;
 };
 
+
+type UpdateRuntimeState = {
+  supported: boolean;
+  status: 'unsupported' | 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'error';
+  currentVersion: string;
+  availableVersion: string | null;
+  progress: number | null;
+  message: string;
+  error: string | null;
+  portable: boolean;
+};
+
 declare global {
   interface Window {
     discordy: {
@@ -94,6 +106,13 @@ declare global {
       };
       clipboard: {
         writeText(text: string): Promise<boolean>;
+      };
+      updates: {
+        getState(): Promise<UpdateRuntimeState>;
+        check(): Promise<UpdateRuntimeState>;
+        download(): Promise<UpdateRuntimeState>;
+        install(): Promise<boolean>;
+        onState(callback: (state: UpdateRuntimeState) => void): () => void;
       };
       desktop: {
         getState(): Promise<DesktopRuntimeState>;
