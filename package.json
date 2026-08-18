@@ -1,6 +1,6 @@
 {
   "name": "discordy-desktop",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "private": true,
   "type": "module",
   "description": "Discordy Desktop - GitHub Releases, auto-update NSIS e distribuição Windows automatizada",
