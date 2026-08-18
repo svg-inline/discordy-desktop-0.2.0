@@ -1,5 +1,17 @@
 # Discordy Desktop 0.11.0 — GitHub Releases e Auto-Update
 
+### FLUX DE RELEASE
+
+npm version 0.11.1 --no-git-tag-version
+
+git add .
+git commit -m "release: 0.11.1"
+
+git tag v0.11.1
+
+git push origin main
+git push origin v0.11.1
+
 Evolução da `0.10.x` com distribuição Windows versionada, GitHub Releases e atualização integrada ao Electron. A arquitetura de sala, signaling e WebRTC permanece independente do canal de atualização.
 
 ## 0.11.0 — Update & Release
@@ -304,8 +316,6 @@ Renderer / localStorage
 └── defaults de criação de sala
 ```
 
-
-
 Evolução da `0.6.0` adicionando chat de sessão diretamente entre os peers por `RTCDataChannel`. O signaling server continua sem transportar mensagens de chat.
 
 ## 0.7.0 — Chat P2P
@@ -371,8 +381,6 @@ sair da sala / kick / fechar sessão
 ```
 
 Sincronização de histórico entre peers novos não faz parte da `0.7.0`.
-
-
 
 Evolução da `0.5.1` com gerenciamento autoritativo da sala no signaling server, sem alterar a arquitetura Mesh P2P da mídia.
 
@@ -452,7 +460,6 @@ Correções de layout para impedir que screen share e tiles de participantes aum
 - overflow mantido dentro dos painéis;
 - comportamento específico para janelas com pouca altura;
 - dock de chamada permanece visível.
-
 
 ## Base herdada — TURN / Connectivity
 
