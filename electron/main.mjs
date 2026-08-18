@@ -22,6 +22,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLOUDFLARED_DOWNLOAD_URL = 'https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/';
 const APP_USER_MODEL_ID = 'dev.discordy.desktop';
 
+const MAX_DEEP_LINK_LENGTH = 4096;
+const MAX_CLIPBOARD_TEXT_LENGTH = 64 * 1024;
+const ALLOWED_INVITE_TTL_MINUTES = new Set([15, 30, 60, 360, 1440]);
+const ROOM_ID_RE = /^[A-Z0-9_-]{1,20}$/;
+const INVITE_TOKEN_RE = /^[A-Za-z0-9_-]{40,128}$/;
+
 const DEFAULT_DESKTOP_PREFERENCES = Object.freeze({
   minimizeToTray: true,
   closeToTray: true,
@@ -72,8 +78,92 @@ function registerProtocol() {
   }
 }
 
+function isLoopbackHostname(hostname) {
+  return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '[::1]' || hostname === '::1';
+}
+
+function normalizeDeepLink(raw) {
+  if (typeof raw !== 'string' || raw.length < 1 || raw.length > MAX_DEEP_LINK_LENGTH) return null;
+  let url;
+  try { url = new URL(raw); } catch { return null; }
+  if (url.protocol !== 'discordy:' || url.hostname !== 'join' || url.username || url.password) return null;
+  const allowedKeys = new Set(['server', 'room', 'token', 'v']);
+  for (const key of url.searchParams.keys()) if (!allowedKeys.has(key)) return null;
+  const roomId = String(url.searchParams.get('room') || '').toUpperCase();
+  const token = String(url.searchParams.get('token') || '');
+  const version = String(url.searchParams.get('v') || '2');
+  if (!ROOM_ID_RE.test(roomId) || !INVITE_TOKEN_RE.test(token) || version !== '2') return null;
+  let server;
+  try { server = new URL(String(url.searchParams.get('server') || '')); } catch { return null; }
+  if (server.username || server.password || server.pathname !== '/' || server.search || server.hash) return null;
+  const secureRemote = server.protocol === 'https:';
+  const localHttp = server.protocol === 'http:' && isLoopbackHostname(server.hostname);
+  if (!secureRemote && !localHttp) return null;
+  url.search = '';
+  url.searchParams.set('server', server.origin);
+  url.searchParams.set('room', roomId);
+  url.searchParams.set('token', token);
+  url.searchParams.set('v', '2');
+  return url.toString();
+}
+
 function extractDeepLink(args) {
-  return args.find((arg) => typeof arg === 'string' && arg.toLowerCase().startsWith('discordy://')) || null;
+  for (const arg of args) {
+    if (typeof arg !== 'string' || !arg.toLowerCase().startsWith('discordy://')) continue;
+    const normalized = normalizeDeepLink(arg);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+
+function isTrustedRendererUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl) return false;
+  try {
+    const current = new URL(rawUrl);
+    const devUrl = process.env.VITE_DEV_SERVER_URL;
+    if (devUrl) return current.origin === new URL(devUrl).origin;
+    if (current.protocol !== 'file:') return false;
+    return fileURLToPath(current) === join(__dirname, '..', 'dist', 'index.html');
+  } catch {
+    return false;
+  }
+}
+
+function assertTrustedIpc(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id) throw new Error('Renderer não autorizado.');
+  const frameUrl = event.senderFrame?.url || event.sender.getURL();
+  if (!isTrustedRendererUrl(frameUrl)) throw new Error('Origem IPC não autorizada.');
+}
+
+function normalizeExternalUrl(raw) {
+  if (typeof raw !== 'string' || raw.length < 1 || raw.length > 4096) return null;
+  try {
+    const url = new URL(raw);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function openExternalSafe(raw) {
+  const url = normalizeExternalUrl(raw);
+  if (!url) return false;
+  await shell.openExternal(url);
+  return true;
+}
+
+function sanitizeHostStartOptions(options = {}) {
+  const roomId = String(options.roomId || '').toUpperCase();
+  const roomName = String(options.roomName || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+  const maxParticipants = Number(options.maxParticipants);
+  const pin = String(options.pin || '').trim();
+  const inviteTtlMinutes = Number(options.inviteTtlMinutes ?? 60);
+  if (!ROOM_ID_RE.test(roomId) || !roomName) throw new Error('Configuração da sala inválida.');
+  if (![2, 3, 4].includes(maxParticipants)) throw new Error('Limite de participantes inválido.');
+  if (pin && !/^\d{4,12}$/.test(pin)) throw new Error('PIN inválido.');
+  if (!ALLOWED_INVITE_TTL_MINUTES.has(inviteTtlMinutes)) throw new Error('Expiração do convite inválida.');
+  return { roomId, roomName, maxParticipants, pin: pin || undefined, approvalRequired: Boolean(options.approvalRequired), inviteTtlMinutes };
 }
 
 function showMainWindow() {
@@ -98,12 +188,13 @@ function toggleMainWindow() {
 }
 
 function deliverDeepLink(url) {
-  if (!url) return;
-  pendingDeepLink = url;
+  const safeUrl = normalizeDeepLink(url);
+  if (!safeUrl) return;
+  pendingDeepLink = safeUrl;
   if (mainWindow && !mainWindow.isDestroyed()) {
     showMainWindow();
     if (!mainWindow.webContents.isLoading()) {
-      mainWindow.webContents.send('app:deep-link', url);
+      mainWindow.webContents.send('app:deep-link', safeUrl);
       pendingDeepLink = null;
     }
   }
@@ -352,12 +443,13 @@ app.on('open-url', (event, url) => {
 function configureMediaPermissions() {
   const ses = session.defaultSession;
   ses.setPermissionCheckHandler((webContents, permission) => {
-    if (!mainWindow || webContents?.id !== mainWindow.webContents.id) return false;
+    if (!mainWindow || webContents?.id !== mainWindow.webContents.id || !isTrustedRendererUrl(webContents.getURL())) return false;
     return permission === 'media' || permission === 'speaker-selection';
   });
 
   ses.setPermissionRequestHandler((webContents, permission, callback) => {
-    callback(Boolean(mainWindow && webContents.id === mainWindow.webContents.id && (permission === 'media' || permission === 'speaker-selection')));
+    const trusted = Boolean(mainWindow && webContents.id === mainWindow.webContents.id && isTrustedRendererUrl(webContents.getURL()));
+    callback(Boolean(trusted && (permission === 'media' || permission === 'speaker-selection')));
   });
 
   ses.setDisplayMediaRequestHandler(async (request, callback) => {
@@ -401,6 +493,10 @@ function createWindow(forceShow = false) {
       nodeIntegration: false,
       sandbox: true,
       webSecurity: true,
+      webviewTag: false,
+      allowRunningInsecureContent: false,
+      safeDialogs: true,
+      devTools: !app.isPackaged,
     },
   });
 
@@ -425,9 +521,17 @@ function createWindow(forceShow = false) {
   });
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith('https://') || url.startsWith('http://')) void shell.openExternal(url);
+    void openExternalSafe(url);
     return { action: 'deny' };
   });
+
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isTrustedRendererUrl(url)) return;
+    event.preventDefault();
+    void openExternalSafe(url);
+  });
+
+  mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
 
   mainWindow.webContents.on('did-finish-load', () => {
     mainWindow?.webContents.send('desktop:preferences-changed', getDesktopRuntimeState());
@@ -446,7 +550,7 @@ function createWindow(forceShow = false) {
 }
 
 ipcMain.handle('screen:list-sources', async (event) => {
-  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) throw new Error('Renderer não autorizado.');
+  assertTrustedIpc(event);
   const sources = await desktopCapturer.getSources({
     types: ['screen', 'window'],
     thumbnailSize: { width: 360, height: 210 },
@@ -462,10 +566,7 @@ ipcMain.handle('screen:list-sources', async (event) => {
 });
 
 ipcMain.on('screen:select-source', (event, payload) => {
-  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) {
-    event.returnValue = false;
-    return;
-  }
+  try { assertTrustedIpc(event); } catch { event.returnValue = false; return; }
   pendingDisplaySelection = {
     sourceId: String(payload?.sourceId || ''),
     includeAudio: Boolean(payload?.includeAudio),
@@ -473,23 +574,31 @@ ipcMain.on('screen:select-source', (event, payload) => {
   event.returnValue = Boolean(pendingDisplaySelection.sourceId);
 });
 
-ipcMain.handle('cloudflared:check', async () => await hostService.checkCloudflared());
-ipcMain.handle('cloudflared:open-download', async () => {
-  await shell.openExternal(CLOUDFLARED_DOWNLOAD_URL);
-  return true;
+ipcMain.handle('cloudflared:check', async (event) => { assertTrustedIpc(event); return await hostService.checkCloudflared(); });
+ipcMain.handle('cloudflared:open-download', async (event) => {
+  assertTrustedIpc(event);
+  return await openExternalSafe(CLOUDFLARED_DOWNLOAD_URL);
 });
-ipcMain.handle('host:start', async (_event, options) => await hostService.start(options));
-ipcMain.handle('host:stop', async () => {
+ipcMain.handle('host:start', async (event, options) => {
+  assertTrustedIpc(event);
+  return await hostService.start(sanitizeHostStartOptions(options));
+});
+ipcMain.handle('host:stop', async (event) => {
+  assertTrustedIpc(event);
   await hostService.stop();
   return true;
 });
-ipcMain.handle('clipboard:write-text', (_event, text) => {
-  clipboard.writeText(String(text || ''));
+ipcMain.handle('clipboard:write-text', (event, text) => {
+  assertTrustedIpc(event);
+  const normalized = String(text || '').slice(0, MAX_CLIPBOARD_TEXT_LENGTH);
+  clipboard.writeText(normalized);
   return true;
 });
 
-ipcMain.handle('desktop:get-state', () => getDesktopRuntimeState());
-ipcMain.handle('desktop:update-preferences', (_event, changes = {}) => {
+ipcMain.handle('desktop:get-state', (event) => { assertTrustedIpc(event); return getDesktopRuntimeState(); });
+ipcMain.handle('desktop:update-preferences', (event, changes = {}) => {
+  assertTrustedIpc(event);
+  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) throw new Error('Preferências inválidas.');
   const previousGlobal = desktopPreferences.globalShortcuts;
   for (const key of Object.keys(DEFAULT_DESKTOP_PREFERENCES)) {
     if (key === 'launchAtStartup') continue;
@@ -504,21 +613,32 @@ ipcMain.handle('desktop:update-preferences', (_event, changes = {}) => {
   sendToRenderer('desktop:preferences-changed', state);
   return state;
 });
-ipcMain.handle('desktop:notify', (_event, payload) => showNativeNotification(payload));
-ipcMain.handle('desktop:show-window', () => {
+ipcMain.handle('desktop:notify', (event, payload) => { assertTrustedIpc(event); return showNativeNotification(payload); });
+ipcMain.handle('desktop:show-window', (event) => {
+  assertTrustedIpc(event);
   showMainWindow();
   return true;
 });
-ipcMain.handle('desktop:hide-window', () => {
+ipcMain.handle('desktop:hide-window', (event) => {
+  assertTrustedIpc(event);
   hideMainWindow();
   return true;
 });
-ipcMain.on('desktop:update-media-state', (_event, state = {}) => {
+ipcMain.on('desktop:update-media-state', (event, state = {}) => {
+  try { assertTrustedIpc(event); } catch { return; }
+  if (!state || typeof state !== 'object' || Array.isArray(state)) return;
   trayMediaState = {
     micEnabled: typeof state.micEnabled === 'boolean' ? state.micEnabled : trayMediaState.micEnabled,
     deafened: typeof state.deafened === 'boolean' ? state.deafened : trayMediaState.deafened,
   };
   rebuildTrayMenu();
+});
+
+app.on('web-contents-created', (_event, contents) => {
+  contents.setWindowOpenHandler(({ url }) => {
+    if (mainWindow && contents.id === mainWindow.webContents.id) void openExternalSafe(url);
+    return { action: 'deny' };
+  });
 });
 
 if (gotLock) {

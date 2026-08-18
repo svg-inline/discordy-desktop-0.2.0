@@ -1,4 +1,5 @@
 export type PresenceState = 'online' | 'reconnecting' | 'disconnected';
+export type InviteTtlMinutes = 15 | 30 | 60 | 360 | 1440;
 
 
 export type ChatMessage = {
@@ -31,6 +32,8 @@ export type RoomInfo = {
   pinRequired: boolean;
   approvalRequired: boolean;
   inviteEnabled: boolean;
+  inviteExpiresAt: number | null;
+  inviteTtlMinutes: InviteTtlMinutes;
   hostPeerId: string | null;
 };
 
@@ -75,7 +78,7 @@ export type ClientMessage =
       resumeToken?: string;
     }
   | { type: 'signal'; target: string; data: SignalPayload }
-  | { type: 'room-update'; changes: { name?: string; maxParticipants?: number; locked?: boolean; approvalRequired?: boolean; pin?: string | null } }
+  | { type: 'room-update'; changes: { name?: string; maxParticipants?: number; locked?: boolean; approvalRequired?: boolean; pin?: string | null; inviteTtlMinutes?: InviteTtlMinutes } }
   | { type: 'kick'; peerId: string }
   | { type: 'join-decision'; requestId: string; approved: boolean }
   | { type: 'invite-regenerate' }
@@ -92,7 +95,7 @@ export type ServerMessage =
   | { type: 'join-request'; request: JoinRequestInfo }
   | { type: 'join-request-removed'; requestId: string }
   | { type: 'join-denied'; message: string }
-  | { type: 'invite-updated'; enabled: boolean; inviteToken?: string }
+  | { type: 'invite-updated'; enabled: boolean; inviteToken?: string; expiresAt?: number; reason?: 'expired' }
   | { type: 'kicked'; message: string }
   | { type: 'signal'; from: string; data: SignalPayload }
   | { type: 'error'; message: string; code?: string };

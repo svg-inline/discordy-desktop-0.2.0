@@ -26,6 +26,7 @@ export class HostService {
         maxParticipants: options.maxParticipants,
         pin: options.pin,
         approvalRequired: options.approvalRequired,
+        inviteTtlMinutes: options.inviteTtlMinutes,
       },
       logger: this.logger,
     });
@@ -34,6 +35,11 @@ export class HostService {
 
     try {
       const tunnel = await this.tunnel.start(this.signaling.baseUrl);
+      const hostSecret = this.signaling.hostSecret;
+      const inviteToken = this.signaling.inviteToken;
+      // O objeto de serviço não precisa conservar uma segunda referência das credenciais brutas.
+      this.signaling.hostSecret = null;
+      this.signaling.inviteToken = null;
       return {
         localUrl: this.signaling.baseUrl,
         publicUrl: tunnel.publicUrl,
@@ -44,8 +50,9 @@ export class HostService {
           name: this.signaling.roomName,
           maxParticipants: this.signaling.maxParticipants,
         },
-        hostSecret: this.signaling.hostSecret,
-        inviteToken: this.signaling.inviteToken,
+        hostSecret,
+        inviteToken,
+        inviteExpiresAt: this.signaling.inviteExpiresAt,
       };
     } catch (error) {
       await this.signaling.close();

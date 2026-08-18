@@ -1,4 +1,5 @@
 import type { ClientMessage, ServerMessage } from './types';
+import { MAX_SIGNALING_MESSAGE_BYTES, parseServerMessage } from './protocolValidation';
 
 type Handler = (message: ServerMessage) => void;
 export type SignalingState = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
@@ -33,6 +34,7 @@ export class SignalingClient {
   private manualClose = false;
   private session: SessionContext | null = null;
   private generation = 0;
+  private invalidServerMessages = 0;
 
   constructor(
     private readonly baseUrl: string,
@@ -61,7 +63,12 @@ export class SignalingClient {
 
   send(message: ClientMessage): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) return false;
-    this.socket.send(JSON.stringify(message));
+    const serialized = JSON.stringify(message);
+    if (new TextEncoder().encode(serialized).byteLength > MAX_SIGNALING_MESSAGE_BYTES) {
+      this.log('mensagem local excedeu o limite de signaling e foi bloqueada');
+      return false;
+    }
+    this.socket.send(serialized);
     return true;
   }
 
@@ -72,6 +79,7 @@ export class SignalingClient {
     if (this.socket?.readyState === WebSocket.OPEN) this.send({ type: 'leave' });
     this.socket?.close(1000, 'client-close');
     this.socket = null;
+    this.session = null;
     this.emitState('closed');
     this.log('fechado pelo cliente');
   }
@@ -123,6 +131,7 @@ export class SignalingClient {
         this.socket = socket;
         const reconnected = isReconnect || this.reconnectAttempt > 0;
         this.reconnectAttempt = 0;
+        this.invalidServerMessages = 0;
         this.emitState('open', { reconnected });
         this.log(reconnected ? 'WebSocket reconectado' : 'WebSocket conectado');
         this.sendJoin();
@@ -132,11 +141,23 @@ export class SignalingClient {
 
       socket.addEventListener('message', (event) => {
         try {
-          const message = JSON.parse(String(event.data)) as ServerMessage;
-          if (message.type === 'welcome' && this.session) this.session.resumeToken = message.sessionToken;
+          const message = parseServerMessage(String(event.data));
+          this.invalidServerMessages = 0;
+          if (message.type === 'welcome' && this.session) {
+            this.session.resumeToken = message.sessionToken;
+            // Credenciais de bootstrap/join não são mais necessárias depois que a sessão recebe um resume token.
+            this.session.inviteToken = undefined;
+            this.session.pin = undefined;
+            this.session.hostSecret = undefined;
+          }
           for (const handler of this.handlers) handler(message);
         } catch (error) {
-          this.log(`mensagem inválida: ${error instanceof Error ? error.message : String(error)}`);
+          this.invalidServerMessages += 1;
+          this.log(`mensagem do servidor rejeitada (${this.invalidServerMessages}/3): ${error instanceof Error ? error.message : String(error)}`);
+          if (this.invalidServerMessages >= 3) {
+            this.log('servidor encerrou confiança do protocolo após mensagens inválidas');
+            try { socket.close(4002, 'invalid-server-protocol'); } catch { /* noop */ }
+          }
         }
       });
 

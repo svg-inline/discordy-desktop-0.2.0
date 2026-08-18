@@ -9,14 +9,14 @@ import { PeerManager } from './rtc/PeerManager';
 import type { PeerDiagnostics } from './rtc/diagnostics';
 import { configSummary, defaultIceConnectivityConfig, fallbackRtcConfiguration, initialRtcConfiguration, loadIceConnectivityConfig, normalizeIceConnectivityConfig, saveIceConnectivityConfig, testTurnConnectivity } from './rtc/iceConfig';
 import type { IceConnectivityConfig, TurnTestResult } from './rtc/iceConfig';
-import type { ChatMessage, JoinRequestInfo, ParticipantInfo, PresenceState, RemotePeer, RoomInfo, ScreenShareMetadata, ServerMessage } from './lib/types';
+import type { ChatMessage, InviteTtlMinutes, JoinRequestInfo, ParticipantInfo, PresenceState, RemotePeer, RoomInfo, ScreenShareMetadata, ServerMessage } from './lib/types';
 import { VoiceMediaController } from './media/VoiceMediaController';
 import type { MediaDeviceCatalog, SensitivityMode, VoiceActivitySnapshot, VoiceInputMode } from './media/VoiceMediaController';
 import { SCREEN_QUALITY_PRESETS, ScreenShareController } from './media/ScreenShareController';
 import type { ScreenQualityPreset, ScreenSourceInfo } from './media/ScreenShareController';
 
 const DEFAULT_MAX_PARTICIPANTS = 4;
-const APP_VERSION = '0.8.0';
+const APP_VERSION = '0.10.0';
 
 type HomeMode = 'home' | 'host' | 'join';
 type ThemeMode = 'dark' | 'onyx';
@@ -49,6 +49,7 @@ type HostState = {
   publicUrl: string;
   invite: string | null;
   inviteToken: string | null;
+  inviteExpiresAt: number | null;
 } | null;
 
 type IconName =
@@ -127,6 +128,14 @@ function videoLabel(video: PeerDiagnostics['receivedVideo']) {
   return `${size} · ${fps}`;
 }
 
+function adaptiveQualityLabel(level: NonNullable<PeerDiagnostics['adaptiveQuality']>['level']) {
+  if (level === 'excellent') return 'Excelente';
+  if (level === 'good') return 'Boa';
+  if (level === 'fair') return 'Moderada';
+  if (level === 'poor') return 'Ruim';
+  return 'Crítica';
+}
+
 
 function presenceLabel(presence: PresenceState) {
   if (presence === 'online') return 'Online';
@@ -134,9 +143,21 @@ function presenceLabel(presence: PresenceState) {
   return 'Desconectado';
 }
 
+function inviteExpiryLabel(expiresAt: number | null | undefined) {
+  if (!expiresAt) return 'Sem convite ativo';
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) return 'Expirado';
+  const minutes = Math.max(1, Math.ceil(remaining / 60_000));
+  if (minutes < 60) return `Expira em ${minutes} min`;
+  const hours = Math.ceil(minutes / 60);
+  if (hours < 24) return `Expira em ${hours} h`;
+  return `Expira em ${Math.ceil(hours / 24)} dia(s)`;
+}
+
 function createChatMessageId() {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
 }
 
 function upsertParticipant(list: ParticipantInfo[], participant: ParticipantInfo) {
@@ -169,10 +190,15 @@ function App() {
   });
   const [hostPin, setHostPin] = useState('');
   const [hostApprovalRequired, setHostApprovalRequired] = useState(() => localStorage.getItem('discordy:host-approval-required') === 'true');
+  const [hostInviteTtlMinutes, setHostInviteTtlMinutes] = useState<InviteTtlMinutes>(() => {
+    const stored = Number(localStorage.getItem('discordy:host-invite-ttl') || '60');
+    return stored === 15 || stored === 30 || stored === 360 || stored === 1440 ? stored : 60;
+  });
   const [roomNameDraft, setRoomNameDraft] = useState('');
   const [roomLimitDraft, setRoomLimitDraft] = useState<2 | 3 | 4>(4);
   const [roomPinDraft, setRoomPinDraft] = useState('');
   const [roomApprovalDraft, setRoomApprovalDraft] = useState(false);
+  const [roomInviteTtlDraft, setRoomInviteTtlDraft] = useState<InviteTtlMinutes>(60);
   const [selfId, setSelfId] = useState<string | null>(null);
   const [serverUrl, setServerUrl] = useState<string | null>(null);
   const [hostState, setHostState] = useState<HostState>(null);
@@ -224,6 +250,7 @@ function App() {
   const [networkTesting, setNetworkTesting] = useState(false);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [diagnosticsUpdatedAt, setDiagnosticsUpdatedAt] = useState<Date | null>(null);
+  const [adaptiveQualityEnabled, setAdaptiveQualityEnabled] = useState(() => localStorage.getItem('discordy:adaptive-quality') !== 'false');
   const [iceConfig, setIceConfig] = useState<IceConnectivityConfig>(() => loadIceConnectivityConfig());
   const [iceDraft, setIceDraft] = useState<IceConnectivityConfig>(() => loadIceConnectivityConfig());
   const [turnTesting, setTurnTesting] = useState(false);
@@ -286,6 +313,7 @@ function App() {
       },
       onTypingChanged: (peerId, typing) => setChatTypingPeers((current) => ({ ...current, [peerId]: typing })),
       onChatChannelChanged: (peerId, ready) => setChatReadyPeers((current) => ({ ...current, [peerId]: ready })),
+      adaptiveQualityEnabled,
       onLog: appendTechnicalLog,
     });
   }
@@ -413,7 +441,10 @@ function App() {
       setRoomNameDraft(message.room.name);
       setRoomLimitDraft(message.room.maxParticipants);
       setRoomApprovalDraft(message.room.approvalRequired);
+      setRoomInviteTtlDraft(message.room.inviteTtlMinutes);
       setJoinPending(false);
+      setJoinPin('');
+      setInviteInput('');
       setSelfPresence('online');
       setStatus(hadSession ? 'Reconectado' : 'Conectado');
       setError(null);
@@ -428,6 +459,7 @@ function App() {
       setRoomNameDraft(message.room.name);
       setRoomLimitDraft(message.room.maxParticipants);
       setRoomApprovalDraft(message.room.approvalRequired);
+      setRoomInviteTtlDraft(message.room.inviteTtlMinutes);
       appendTechnicalLog(`[ROOM] estado atualizado name="${message.room.name}" limit=${message.room.maxParticipants} locked=${message.room.locked} approval=${message.room.approvalRequired}`);
       return;
     }
@@ -453,14 +485,15 @@ function App() {
     if (message.type === 'invite-updated') {
       setHostState((current) => {
         if (!current) return current;
-        if (!message.enabled || !message.inviteToken || !roomIdRef.current) return { ...current, invite: null, inviteToken: null };
+        if (!message.enabled || !message.inviteToken || !roomIdRef.current) return { ...current, invite: null, inviteToken: null, inviteExpiresAt: null };
         return {
           ...current,
           inviteToken: message.inviteToken,
+          inviteExpiresAt: message.expiresAt ?? null,
           invite: createInvite(current.publicUrl, roomIdRef.current, message.inviteToken),
         };
       });
-      setStatus(message.enabled ? 'Novo convite gerado' : 'Convite invalidado');
+      setStatus(message.enabled ? 'Novo convite gerado' : message.reason === 'expired' ? 'Convite expirado' : 'Convite invalidado');
       return;
     }
 
@@ -484,6 +517,10 @@ function App() {
     }
 
     if (message.type === 'signal') {
+      if (!peerManager.hasPeer(message.from)) {
+        appendTechnicalLog(`[SECURITY] signaling de peer desconhecido bloqueado: ${message.from.slice(0, 8)}`);
+        return;
+      }
       try {
         await peerManager.handleSignal(message.from, message.data);
       } catch (cause) {
@@ -617,9 +654,10 @@ function App() {
         maxParticipants: hostMaxParticipants,
         pin: hostPin || undefined,
         approvalRequired: hostApprovalRequired,
+        inviteTtlMinutes: hostInviteTtlMinutes,
       });
       const invite = createInvite(hosted.publicUrl, hosted.room.roomId, hosted.inviteToken);
-      setHostState({ localUrl: hosted.localUrl, publicUrl: hosted.publicUrl, invite, inviteToken: hosted.inviteToken });
+      setHostState({ localUrl: hosted.localUrl, publicUrl: hosted.publicUrl, invite, inviteToken: hosted.inviteToken, inviteExpiresAt: hosted.inviteExpiresAt });
       setRoomPinDraft(hostPin);
       setIsHosting(true);
       await connectToRoom(hosted.localUrl, hosted.room.roomId, name, { hostSecret: hosted.hostSecret });
@@ -715,10 +753,11 @@ function App() {
         maxParticipants: roomLimitDraft,
         approvalRequired: roomApprovalDraft,
         pin: roomPinDraft || null,
+        inviteTtlMinutes: roomInviteTtlDraft,
       },
     });
     setStatus('Configurações da sala enviadas');
-  }, [isHosting, roomApprovalDraft, roomInfo, roomLimitDraft, roomNameDraft, roomPinDraft]);
+  }, [isHosting, roomApprovalDraft, roomInfo, roomInviteTtlDraft, roomLimitDraft, roomNameDraft, roomPinDraft]);
 
   const toggleRoomLocked = useCallback(() => {
     if (!roomInfo || !isHosting) return;
@@ -999,6 +1038,7 @@ function App() {
       `STUN: ${iceConfig.stunUrls.join(', ') || 'nenhum'}`,
       `TURN: ${iceConfig.turnUrls.join(', ') || 'nenhum'}`,
       `TURN auth: ${iceConfig.turnUsername ? 'configurada' : 'não configurada'}`,
+      `Qualidade adaptativa: ${adaptiveQualityEnabled ? 'ativada' : 'desativada'}`,
       '',
     ];
 
@@ -1019,6 +1059,14 @@ function App() {
         `  Codecs TX: ${peer.outboundCodecs.join(', ') || 'n/d'}`,
         `  Codecs RX: ${peer.inboundCodecs.join(', ') || 'n/d'}`,
         `  Vídeo RX: ${videoLabel(peer.receivedVideo)}`,
+        ...(peer.adaptiveQuality ? [
+          `  Adaptive: ${adaptiveQualityLabel(peer.adaptiveQuality.level)}${peer.adaptiveQuality.badConnection ? ' [CONEXÃO RUIM]' : ''}`,
+          `  Adaptive reason: ${peer.adaptiveQuality.reason}`,
+          `  Outgoing disponível: ${formatBitrate(peer.adaptiveQuality.availableOutgoingKbps)}`,
+          `  Alvo tela: ${peer.adaptiveQuality.targetScreenBitrateKbps === null ? 'n/d' : formatBitrate(peer.adaptiveQuality.targetScreenBitrateKbps)}`,
+          `  Alvo câmera: ${peer.adaptiveQuality.targetCameraBitrateKbps === null ? 'n/d' : formatBitrate(peer.adaptiveQuality.targetCameraBitrateKbps)}`,
+          `  Adaptive FPS/scale: ${peer.adaptiveQuality.targetFps} FPS / ${peer.adaptiveQuality.scaleResolutionDownBy.toFixed(2)}x`,
+        ] : []),
         '',
       );
     }
@@ -1026,7 +1074,7 @@ function App() {
     lines.push('User-Agent:', navigator.userAgent, '', 'Logs recentes:');
     lines.push(...(technicalLogs.length ? technicalLogs.slice(-80) : ['Sem logs técnicos.']));
     return lines.join('\n');
-  }, [iceConfig, isHosting, serverUrl, status, technicalLogs]);
+  }, [adaptiveQualityEnabled, iceConfig, isHosting, serverUrl, status, technicalLogs]);
 
   const copyTechnicalReport = useCallback(async () => {
     const diagnostics = networkDiagnostics.length > 0 ? networkDiagnostics : await refreshDiagnostics();
@@ -1078,6 +1126,14 @@ function App() {
       setTurnTesting(false);
     }
   }, [appendTechnicalLog, iceDraft, turnTesting]);
+
+  const updateAdaptiveQuality = useCallback((enabled: boolean) => {
+    setAdaptiveQualityEnabled(enabled);
+    localStorage.setItem('discordy:adaptive-quality', String(enabled));
+    peerManagerRef.current?.setAdaptiveQualityEnabled(enabled);
+    setStatus(enabled ? 'Qualidade adaptativa ativada' : 'Qualidade adaptativa desativada');
+    appendTechnicalLog(`[ADAPTIVE] ${enabled ? 'ativado' : 'desativado'} pelo usuário`);
+  }, [appendTechnicalLog]);
 
   const updateTheme = (next: ThemeMode) => {
     setTheme(next);
@@ -1138,7 +1194,8 @@ function App() {
     localStorage.setItem('discordy:host-room-name', hostRoomName.slice(0, 60));
     localStorage.setItem('discordy:host-max-participants', String(hostMaxParticipants));
     localStorage.setItem('discordy:host-approval-required', String(hostApprovalRequired));
-  }, [hostApprovalRequired, hostMaxParticipants, hostRoomName]);
+    localStorage.setItem('discordy:host-invite-ttl', String(hostInviteTtlMinutes));
+  }, [hostApprovalRequired, hostInviteTtlMinutes, hostMaxParticipants, hostRoomName]);
 
   useEffect(() => {
     if (localPreviewRef.current) localPreviewRef.current.srcObject = cameraStream;
@@ -1369,7 +1426,7 @@ function App() {
               {hostState && (
                 <section className={`sidebar-card ${!hostState.invite ? 'sidebar-card--muted' : ''}`}>
                   <div className="sidebar-card__title"><Icon name="users" size={15} /><strong>Convite da sala</strong></div>
-                  <p>{hostState.invite ? hostState.publicUrl.replace(/^https?:\/\//, '') : 'Convite invalidado'}</p>
+                  <p>{hostState.invite ? `${hostState.publicUrl.replace(/^https?:\/\//, '')} · ${inviteExpiryLabel(hostState.inviteExpiresAt)}` : 'Convite inválido ou expirado'}</p>
                   <div className="sidebar-card__actions">
                     <button className="sidebar-action" disabled={!hostState.invite} onClick={() => void copyInvite()}><Icon name="copy" size={15} />Copiar</button>
                     <button className="sidebar-action sidebar-action--secondary" onClick={regenerateInvite}>Novo</button>
@@ -1509,6 +1566,9 @@ function App() {
                       <label>PIN opcional
                         <input type="password" inputMode="numeric" value={roomPinDraft} maxLength={12} onChange={(event) => setRoomPinDraft(event.target.value.replace(/\D/g, '').slice(0, 12))} placeholder={roomInfo.pinRequired ? 'PIN atual configurado' : 'Sem PIN'} />
                       </label>
+                      <label>Expiração de novos convites
+                        <select value={roomInviteTtlDraft} onChange={(event) => setRoomInviteTtlDraft(Number(event.target.value) as InviteTtlMinutes)}><option value={15}>15 minutos</option><option value={30}>30 minutos</option><option value={60}>1 hora</option><option value={360}>6 horas</option><option value={1440}>24 horas</option></select>
+                      </label>
                       <label className="settings-checkbox"><input type="checkbox" checked={roomApprovalDraft} onChange={(event) => setRoomApprovalDraft(event.target.checked)} /><span>Exigir confirmação do host para entrar</span></label>
                       <button className="button button--primary" onClick={updateRoomSettings}>Salvar configurações</button>
                     </div>
@@ -1525,7 +1585,7 @@ function App() {
                     <div className="settings-group">
                       <strong>Convite</strong>
                       <div className="room-invite-state">
-                        <div><strong>{roomInfo.inviteEnabled ? 'Convite ativo' : 'Convite invalidado'}</strong><small>Gerar um novo convite invalida imediatamente o link anterior.</small></div>
+                        <div><strong>{roomInfo.inviteEnabled ? 'Convite ativo' : 'Convite inválido/expirado'}</strong><small>{roomInfo.inviteEnabled ? `${inviteExpiryLabel(roomInfo.inviteExpiresAt)} · Gerar outro invalida o link atual.` : 'Gere um novo convite para liberar novas entradas.'}</small></div>
                         <div className="actions">
                           <button className="button" onClick={regenerateInvite}>Gerar novo convite</button>
                           <button className="button button--danger-subtle" disabled={!roomInfo.inviteEnabled} onClick={invalidateInvite}>Invalidar convite</button>
@@ -1663,6 +1723,14 @@ function App() {
                     </div>
                   </div>
                   <div className="network-drawer__body">
+                    <section className="adaptive-quality-settings">
+                      <div className="adaptive-quality-settings__header">
+                        <div><strong>Qualidade adaptativa</strong><span>Bitrate, FPS e resolução por peer usando getStats()</span></div>
+                        <label className="switch-control"><input type="checkbox" checked={adaptiveQualityEnabled} onChange={(event) => updateAdaptiveQuality(event.target.checked)} /><span /></label>
+                      </div>
+                      <p className="connectivity-note">O Discordy reduz vídeo/tela quando detecta packet loss, RTT alto ou pouco upload disponível e recupera qualidade gradualmente. Áudio recebe prioridade alta e vídeo é degradado primeiro.</p>
+                    </section>
+
                     <section className="connectivity-settings">
                       <div className="connectivity-settings__header">
                         <div><strong>STUN / TURN</strong><span>Ativo: {configSummary(iceConfig)}</span></div>
@@ -1709,7 +1777,10 @@ function App() {
                       <article className="network-peer" key={peer.peerId}>
                         <header className="network-peer__header">
                           <div><span className="avatar avatar--xs avatar--remote">{initialFor(peer.name)}</span><div><strong>{peer.name}</strong><span>{peer.peerId.slice(0, 8)}</span></div></div>
-                          <span className={`route-badge route-badge--${peer.route}`}>{routeLabel(peer.route)}</span>
+                          <div className="network-peer__badges">
+                            {peer.adaptiveQuality && <span className={`quality-badge quality-badge--${peer.adaptiveQuality.level}`}>{peer.adaptiveQuality.badConnection ? 'Conexão ruim' : adaptiveQualityLabel(peer.adaptiveQuality.level)}</span>}
+                            <span className={`route-badge route-badge--${peer.route}`}>{routeLabel(peer.route)}</span>
+                          </div>
                         </header>
                         <div className="network-route">
                           <span><small>ICE selecionado</small><strong>{peer.localCandidateType} ↔ {peer.remoteCandidateType}</strong></span>
@@ -1724,7 +1795,17 @@ function App() {
                           <span><small>Upload</small><strong>{formatBitrate(peer.bitrateUpKbps)}</strong></span>
                           <span><small>Download</small><strong>{formatBitrate(peer.bitrateDownKbps)}</strong></span>
                           <span><small>Vídeo recebido</small><strong>{videoLabel(peer.receivedVideo)}</strong></span>
+                          {peer.adaptiveQuality && <span><small>Upload disponível</small><strong>{formatBitrate(peer.adaptiveQuality.availableOutgoingKbps)}</strong></span>}
+                          {peer.adaptiveQuality && <span><small>Qualidade TX</small><strong>{adaptiveQualityLabel(peer.adaptiveQuality.level)}</strong></span>}
+                          {peer.adaptiveQuality && <span><small>FPS / escala TX</small><strong>{peer.adaptiveQuality.targetFps} FPS · {peer.adaptiveQuality.scaleResolutionDownBy.toFixed(2)}×</strong></span>}
                         </div>
+                        {peer.adaptiveQuality && (
+                          <div className={`adaptive-peer-state ${peer.adaptiveQuality.badConnection ? 'is-bad' : ''}`}>
+                            <strong>{peer.adaptiveQuality.badConnection ? 'Conexão ruim detectada' : `Controle adaptativo: ${adaptiveQualityLabel(peer.adaptiveQuality.level)}`}</strong>
+                            <span>{peer.adaptiveQuality.reason}</span>
+                            <small>Tela {peer.adaptiveQuality.targetScreenBitrateKbps === null ? '—' : formatBitrate(peer.adaptiveQuality.targetScreenBitrateKbps)} · Câmera {peer.adaptiveQuality.targetCameraBitrateKbps === null ? '—' : formatBitrate(peer.adaptiveQuality.targetCameraBitrateKbps)}</small>
+                          </div>
+                        )}
                         <div className="network-codecs">
                           <span><small>Codec TX</small><strong>{peer.outboundCodecs.join(', ') || '—'}</strong></span>
                           <span><small>Codec RX</small><strong>{peer.inboundCodecs.join(', ') || '—'}</strong></span>
@@ -1884,7 +1965,7 @@ function App() {
             <section className="welcome-card">
               <div className="welcome-card__intro">
                 <div className="welcome-logo">D</div>
-                <p className="eyebrow">Discordy Desktop 0.7.0</p>
+                <p className="eyebrow">Discordy Desktop 0.10.0</p>
                 <h1>Sua sala privada, direto entre os participantes.</h1>
                 <p>WebRTC P2P para voz e compartilhamento de tela, com signaling hospedado pelo próprio host.</p>
               </div>
@@ -1917,6 +1998,7 @@ function App() {
                     <label>Nome da sala<input value={hostRoomName} maxLength={60} onChange={(event) => setHostRoomName(event.target.value)} placeholder="Sala dos amigos" /></label>
                     <label>Limite<select value={hostMaxParticipants} onChange={(event) => setHostMaxParticipants(Number(event.target.value) as 2 | 3 | 4)}><option value={2}>2 participantes</option><option value={3}>3 participantes</option><option value={4}>4 participantes</option></select></label>
                     <label>PIN opcional<input type="password" inputMode="numeric" value={hostPin} maxLength={12} onChange={(event) => setHostPin(event.target.value.replace(/\D/g, '').slice(0, 12))} placeholder="4–12 números" /></label>
+                    <label>Expiração do convite<select value={hostInviteTtlMinutes} onChange={(event) => setHostInviteTtlMinutes(Number(event.target.value) as InviteTtlMinutes)}><option value={15}>15 minutos</option><option value={30}>30 minutos</option><option value={60}>1 hora</option><option value={360}>6 horas</option><option value={1440}>24 horas</option></select></label>
                     <label className="settings-checkbox room-create-checkbox"><input type="checkbox" checked={hostApprovalRequired} onChange={(event) => setHostApprovalRequired(event.target.checked)} /><span>Confirmar cada entrada manualmente</span></label>
                   </div>
                   <div className={`dependency ${cloudflared?.installed ? 'dependency--ok' : 'dependency--missing'}`}>

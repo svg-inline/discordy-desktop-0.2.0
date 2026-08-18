@@ -1,4 +1,197 @@
-# Discordy Desktop 0.8.0 — Desktop Experience
+# Discordy Desktop 0.10.0 — Segurança
+
+Evolução da `0.9.0` com hardening do signaling, convites, identidade dos peers e superfície privilegiada do Electron, sem alterar a arquitetura Mesh P2P.
+
+## 0.10.0 — Segurança
+
+Implementado:
+
+- tokens de convite criptograficamente aleatórios de 256 bits;
+- servidor armazena apenas o `SHA-256` dos tokens de convite e sessão;
+- convite com expiração configurável: `15 min`, `30 min`, `1 h`, `6 h` ou `24 h`;
+- regenerar convite invalida imediatamente o token anterior;
+- credencial bootstrap do host é aleatória, armazenada somente como hash e aceita uma única vez;
+- session token rotacionado após cada retomada de sessão;
+- `peerId` e IDs de solicitações gerados com `node:crypto`;
+- rate limiting por conexão e por identidade para WebSocket, join e ações de controle;
+- validação rígida por tipo de todas as mensagens de signaling;
+- campos desconhecidos e payloads ambíguos são rejeitados;
+- limite de signaling de `96 KiB` no `ws` e antes do `JSON.parse`;
+- compressão WebSocket desativada no signaling;
+- proteção contra peer spoofing: o cliente nunca escolhe o campo `from`;
+- signaling só pode ser encaminhado para peer online da mesma sala;
+- autorização de host validada pelo servidor para configurações, kick, aprovação e convites;
+- validação defensiva também no cliente para mensagens recebidas do servidor;
+- deep links `discordy://` estritamente validados;
+- servidor remoto de convite exige HTTPS; HTTP é aceito apenas para loopback;
+- CSP restritiva no renderer;
+- `contextIsolation: true`;
+- `sandbox: true`;
+- `nodeIntegration: false`;
+- `webSecurity: true`;
+- `webview` desabilitado;
+- navegação e criação de novas janelas bloqueadas;
+- URLs externas aceitas apenas em `http:`/`https:` e abertas fora do Electron;
+- todos os IPCs verificam WebContents/frame/origem autorizada;
+- preload expõe somente uma API mínima e congelada, sem expor `ipcRenderer`;
+- limites adicionais para clipboard, notificações, deep links e argumentos IPC.
+
+### Fluxo de credenciais
+
+```text
+Criar sala
+├── invite token 256-bit → cliente recebe token bruto uma vez
+│   └── servidor guarda somente SHA-256
+│
+└── host bootstrap 256-bit → usado uma única vez
+    └── depois é destruído no servidor
+
+Participante entra
+└── session token 256-bit
+    ├── cliente guarda token bruto da sessão
+    └── servidor guarda somente SHA-256
+
+Resume
+└── token válido → autentica identidade anterior
+    └── servidor rotaciona imediatamente o session token
+```
+
+### Rate limiting
+
+```text
+WebSocket por conexão
+├── geral:    300 mensagens / 10 s
+├── signal:   240 mensagens / 10 s
+├── join:       8 tentativas / 60 s
+└── controle:  40 mensagens / 60 s
+
+Por identidade
+├── upgrade WebSocket: 60 / min
+└── página /join:     120 / min
+```
+
+Após violações repetidas, a conexão WebSocket é encerrada.
+
+### Limites e validação
+
+O signaling aceita somente contratos conhecidos:
+
+```text
+join
+signal
+room-update
+kick
+join-decision
+invite-regenerate
+invite-invalidate
+leave
+```
+
+Cada contrato possui allow-list de campos e limites próprios para nomes, IDs, SDP, ICE candidates, mídia e metadados de screen share.
+
+### Proteção contra spoofing
+
+```text
+Cliente A envia:
+{ type: "signal", target: "peer-B", data: ... }
+
+Servidor envia para B:
+{ type: "signal", from: A_AUTENTICADO, data: ... }
+```
+
+Não existe campo `from` aceito do cliente. O destino precisa existir, estar `online` e pertencer à mesma sala.
+
+### Electron hardening
+
+O renderer não recebe APIs Node/Electron diretamente:
+
+```text
+Renderer
+   │
+   ▼
+preload.cjs
+   │ API explícita / argumentos limitados
+   ▼
+IPC
+   │ assertTrustedIpc()
+   ▼
+Main Process
+```
+
+O processo principal bloqueia navegação arbitrária, novas janelas Electron e anexação de `webview`.
+
+### Histórico — 0.9.0 Adaptive Quality
+
+Implementado:
+
+- amostragem automática por peer a cada `2s` usando `RTCPeerConnection.getStats()`;
+- bitrate adaptativo por `RTCRtpSender.setParameters()`;
+- redução automática de vídeo/tela quando há packet loss, RTT alto ou pouco upload disponível;
+- FPS adaptativo;
+- resolução adaptativa por `scaleResolutionDownBy` sem alterar a captura dos outros peers;
+- cinco níveis: `excellent`, `good`, `fair`, `poor` e `critical`;
+- detecção explícita de conexão ruim;
+- recuperação com histerese: degrada rápido e recupera gradualmente;
+- microfone e áudio da transmissão com prioridade `high`;
+- câmera e screen share com prioridade inferior ao áudio;
+- bitrate máximo do screen share continua sendo o teto escolhido pelo usuário;
+- adaptação independente para cada participante da sala;
+- painel de diagnóstico mostrando nível, motivo, upload disponível, FPS, escala e bitrate alvo;
+- controle para ativar/desativar Adaptive Quality;
+- relatório técnico inclui o estado adaptativo por peer.
+
+### Política de qualidade
+
+```text
+excellent  100% bitrate   60 FPS máx.   escala 1.00x
+good        85% bitrate   45 FPS máx.   escala 1.00x
+fair        65% bitrate   30 FPS máx.   escala 1.25x
+poor        45% bitrate   20 FPS máx.   escala 1.75x
+critical    25% bitrate   12 FPS máx.   escala 2.50x
+```
+
+O nível é calculado a partir de:
+
+```text
+selected candidate pair
+├── currentRoundTripTime
+├── availableOutgoingBitrate
+└── connection/ICE state
+
+remote-inbound-rtp + outbound-rtp
+└── packet loss por intervalo
+```
+
+### Prioridade de áudio
+
+O Discordy mantém áudio antes de vídeo em congestionamento:
+
+```text
+Microfone / áudio do sistema
+└── priority = high
+    maxBitrate = 96 Kbps por sender
+
+Câmera / screen share
+└── priority = low / very-low em conexão ruim
+    maxBitrate adaptativo
+    maxFramerate adaptativo
+    scaleResolutionDownBy adaptativo
+```
+
+Isso preserva inteligibilidade da chamada mesmo quando a tela precisa perder resolução/FPS.
+
+### Histerese
+
+```text
+Piora crítica  → aplica imediatamente
+Piora normal   → confirma em 2 amostras
+Recuperação    → exige 4 amostras estáveis
+                 e sobe apenas 1 nível por vez
+```
+
+---
+
+# Histórico — 0.8.0 Desktop Experience
 
 Evolução da `0.7.0` adicionando integração real com o desktop Windows sem alterar o transporte WebRTC/RTCDataChannel.
 

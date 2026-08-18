@@ -1,6 +1,8 @@
 import type { ChatMessage, MediaSource, PeerInfo, RemotePeer, ScreenShareMetadata, SignalPayload } from '../lib/types';
 import { collectPeerDiagnostics } from './diagnostics';
 import type { PeerDiagnostics } from './diagnostics';
+import { ADAPTIVE_QUALITY_ORDER, ADAPTIVE_QUALITY_PROFILES, collectAdaptiveNetworkSample, initialAdaptiveSnapshot, makeAdaptiveSnapshot, recommendAdaptiveQuality } from './adaptiveQuality';
+import type { AdaptiveQualityLevel, AdaptiveQualitySnapshot } from './adaptiveQuality';
 
 type SenderSlots = {
   microphone?: RTCRtpSender;
@@ -29,6 +31,10 @@ type PeerState = {
   chatChannel: RTCDataChannel | null;
   chatReady: boolean;
   seenChatMessageIds: Set<string>;
+  adaptiveQuality: AdaptiveQualitySnapshot;
+  adaptiveCandidate: AdaptiveQualityLevel;
+  adaptiveCandidateCount: number;
+  senderPolicyKeys: Partial<Record<keyof SenderSlots, string>>;
 };
 
 type PeerManagerOptions = {
@@ -39,6 +45,7 @@ type PeerManagerOptions = {
   onChatMessage?: (message: ChatMessage) => void;
   onTypingChanged?: (peerId: string, typing: boolean) => void;
   onChatChannelChanged?: (peerId: string, ready: boolean) => void;
+  adaptiveQualityEnabled?: boolean;
   onLog?: (message: string) => void;
 };
 
@@ -48,6 +55,13 @@ const CHAT_CHANNEL_LABEL = 'discordy-chat';
 const CHAT_PROTOCOL = 'discordy-chat-v1';
 const MAX_CHAT_MESSAGE_LENGTH = 2000;
 const MAX_CHAT_PACKET_BYTES = 8192;
+const ADAPTIVE_SAMPLE_INTERVAL_MS = 2000;
+const CAMERA_BASELINE_BITRATE_KBPS = 1800;
+const AUDIO_MAX_BITRATE_BPS = 96000;
+
+type ExtendedEncodingParameters = RTCRtpEncodingParameters & {
+  priority?: 'very-low' | 'low' | 'medium' | 'high';
+};
 
 export class PeerManager {
   private readonly peers = new Map<string, PeerState>();
@@ -67,6 +81,9 @@ export class PeerManager {
   private microphoneEnabled = true;
   private screenShareMetadata: ScreenShareMetadata | null = null;
   private screenBitrateKbps = 4500;
+  private adaptiveQualityEnabled = true;
+  private adaptiveQualityTimer: number | null = null;
+  private adaptiveQualityCycleRunning = false;
 
   constructor(options: PeerManagerOptions) {
     this.rtcConfiguration = { ...options.rtcConfiguration, iceServers: [...(options.rtcConfiguration.iceServers ?? [])] };
@@ -76,6 +93,7 @@ export class PeerManager {
     this.onChatMessage = options.onChatMessage ?? (() => undefined);
     this.onTypingChanged = options.onTypingChanged ?? (() => undefined);
     this.onChatChannelChanged = options.onChatChannelChanged ?? (() => undefined);
+    this.adaptiveQualityEnabled = options.adaptiveQualityEnabled ?? true;
     this.onLog = options.onLog ?? (() => undefined);
   }
 
@@ -101,6 +119,38 @@ export class PeerManager {
 
   setLocalPeerId(peerId: string | null) {
     this.localPeerId = peerId;
+  }
+
+  hasPeer(peerId: string) {
+    return this.peers.has(peerId);
+  }
+
+  setAdaptiveQualityEnabled(enabled: boolean) {
+    this.adaptiveQualityEnabled = enabled;
+    this.logAll(`qualidade adaptativa ${enabled ? 'ativada' : 'desativada'}`);
+    for (const state of this.peers.values()) {
+      state.adaptiveCandidate = 'excellent';
+      state.adaptiveCandidateCount = 0;
+      if (!enabled) {
+        const sample = {
+          sampledAt: new Date().toISOString(),
+          connectionState: state.pc.connectionState,
+          iceConnectionState: state.pc.iceConnectionState,
+          packetLossPct: null,
+          rttMs: null,
+          availableOutgoingKbps: null,
+        };
+        state.adaptiveQuality = makeAdaptiveSnapshot(sample, 'excellent', 'controle adaptativo desativado', this.screenStream ? this.screenBitrateKbps : null, this.cameraStream ? CAMERA_BASELINE_BITRATE_KBPS : null);
+      }
+      void this.applyAdaptiveSenderParameters(state);
+    }
+    if (enabled) this.ensureAdaptiveQualityLoop();
+    else this.stopAdaptiveQualityLoop();
+    this.emitPeers();
+  }
+
+  isAdaptiveQualityEnabled() {
+    return this.adaptiveQualityEnabled;
   }
 
   setMicrophone(stream: MediaStream | null) {
@@ -135,7 +185,7 @@ export class PeerManager {
     if (this.screenShareMetadata) this.screenShareMetadata = { ...this.screenShareMetadata, bitrateKbps: this.screenBitrateKbps };
     for (const state of this.peers.values()) {
       const sender = state.senders.screenVideo;
-      if (sender) void this.applyScreenSenderParameters(state, sender);
+      if (sender) void this.applyAdaptiveVideoSenderParameters(state, 'screenVideo', sender);
     }
     if (this.screenStream) this.broadcastMediaState('screen', true, this.screenStream.getVideoTracks()[0]?.id ?? null, this.screenShareMetadata);
     this.logAll(`bitrate máximo da tela=${this.screenBitrateKbps} Kbps`);
@@ -144,6 +194,10 @@ export class PeerManager {
   updateScreenMetadata(metadata: ScreenShareMetadata) {
     this.screenShareMetadata = metadata;
     this.screenBitrateKbps = metadata.bitrateKbps;
+    for (const state of this.peers.values()) {
+      const sender = state.senders.screenVideo;
+      if (sender) void this.applyAdaptiveVideoSenderParameters(state, 'screenVideo', sender);
+    }
     if (this.screenStream) this.broadcastMediaState('screen', true, this.screenStream.getVideoTracks()[0]?.id ?? null, metadata);
   }
 
@@ -177,6 +231,10 @@ export class PeerManager {
       chatChannel: null,
       chatReady: false,
       seenChatMessageIds: new Set<string>(),
+      adaptiveQuality: initialAdaptiveSnapshot(),
+      adaptiveCandidate: 'excellent',
+      adaptiveCandidateCount: 0,
+      senderPolicyKeys: {},
     };
 
     this.peers.set(info.peerId, state);
@@ -185,6 +243,7 @@ export class PeerManager {
     this.syncLocalMedia(state);
     this.sendCurrentMediaState(info.peerId);
     this.log(info.peerId, `peer criado (${polite ? 'polite' : 'impolite'})`);
+    this.ensureAdaptiveQualityLoop();
     this.emitPeers();
   }
 
@@ -202,6 +261,7 @@ export class PeerManager {
     this.closeChatChannel(state);
     if (state.pc.signalingState !== 'closed') state.pc.close();
     this.peers.delete(peerId);
+    if (this.peers.size === 0) this.stopAdaptiveQualityLoop();
     this.log(peerId, `peer removido (${reason})`);
     this.emitPeers();
   }
@@ -213,6 +273,7 @@ export class PeerManager {
   }
 
   reset() {
+    this.stopAdaptiveQualityLoop();
     this.resetPeers('session-reset');
     this.localPeerId = null;
     this.microphoneStream = null;
@@ -253,7 +314,9 @@ export class PeerManager {
   async getDiagnostics(): Promise<PeerDiagnostics[]> {
     const results = await Promise.all([...this.peers.values()].map(async (state) => {
       try {
-        return await collectPeerDiagnostics(state.info.peerId, state.info.name, state.pc);
+        const diagnostics = await collectPeerDiagnostics(state.info.peerId, state.info.name, state.pc);
+        const result: PeerDiagnostics = { ...diagnostics, adaptiveQuality: { ...state.adaptiveQuality } };
+        return result;
       } catch (cause) {
         this.log(state.info.peerId, `falha coletando getStats(): ${this.errorMessage(cause)}`);
         return null;
@@ -595,6 +658,7 @@ export class PeerManager {
           this.log(state.info.peerId, `falha removendo ${slot}: ${this.errorMessage(cause)}`);
         }
         delete state.senders[slot];
+        delete state.senderPolicyKeys[slot];
       }
       return;
     }
@@ -603,6 +667,8 @@ export class PeerManager {
     if (current && current.track?.kind === track.kind) {
       void current.replaceTrack(track).then(() => {
         this.log(state.info.peerId, `${slot} substituído sem renegociação`);
+        delete state.senderPolicyKeys[slot];
+        void this.applySenderPolicy(state, slot, current);
       }).catch((cause) => {
         this.log(state.info.peerId, `falha em replaceTrack(${slot}): ${this.errorMessage(cause)}`);
       });
@@ -610,7 +676,7 @@ export class PeerManager {
     }
 
     state.senders[slot] = state.pc.addTrack(track, stream);
-    if (slot === 'screenVideo') void this.applyScreenSenderParameters(state, state.senders[slot]!);
+    void this.applySenderPolicy(state, slot, state.senders[slot]!);
     this.log(state.info.peerId, `${slot} adicionado (${track.kind}/${track.id.slice(0, 8)})`);
   }
 
@@ -706,18 +772,140 @@ export class PeerManager {
     })));
   }
 
-  private async applyScreenSenderParameters(state: PeerState, sender: RTCRtpSender) {
+  private ensureAdaptiveQualityLoop() {
+    if (!this.adaptiveQualityEnabled || this.peers.size === 0 || this.adaptiveQualityTimer !== null) return;
+    void this.runAdaptiveQualityCycle();
+    this.adaptiveQualityTimer = window.setInterval(() => void this.runAdaptiveQualityCycle(), ADAPTIVE_SAMPLE_INTERVAL_MS);
+  }
+
+  private stopAdaptiveQualityLoop() {
+    if (this.adaptiveQualityTimer !== null) window.clearInterval(this.adaptiveQualityTimer);
+    this.adaptiveQualityTimer = null;
+  }
+
+  private requestedVideoBitrateKbps() {
+    return (this.screenStream ? this.screenBitrateKbps : 0) + (this.cameraStream ? CAMERA_BASELINE_BITRATE_KBPS : 0);
+  }
+
+  private async runAdaptiveQualityCycle() {
+    if (!this.adaptiveQualityEnabled || this.adaptiveQualityCycleRunning || this.peers.size === 0) return;
+    this.adaptiveQualityCycleRunning = true;
+    try {
+      const requestedVideoKbps = this.requestedVideoBitrateKbps();
+      for (const state of this.peers.values()) {
+        if (state.pc.signalingState === 'closed') continue;
+        try {
+          const sample = await collectAdaptiveNetworkSample(state.pc);
+          const recommendation = recommendAdaptiveQuality(sample, requestedVideoKbps);
+          const nextLevel = this.resolveAdaptiveLevel(state, recommendation.level);
+          const previousLevel = state.adaptiveQuality.level;
+          state.adaptiveQuality = makeAdaptiveSnapshot(
+            sample,
+            nextLevel,
+            recommendation.reason,
+            this.screenStream ? this.screenBitrateKbps : null,
+            this.cameraStream ? CAMERA_BASELINE_BITRATE_KBPS : null,
+          );
+          await this.applyAdaptiveSenderParameters(state);
+          if (previousLevel !== nextLevel) {
+            this.log(state.info.peerId, `qualidade adaptativa ${previousLevel} -> ${nextLevel}: ${recommendation.reason}; loss=${sample.packetLossPct?.toFixed(1) ?? 'n/d'}% rtt=${sample.rttMs?.toFixed(0) ?? 'n/d'}ms out=${sample.availableOutgoingKbps?.toFixed(0) ?? 'n/d'}Kbps`);
+            this.emitPeers();
+          }
+        } catch (cause) {
+          this.log(state.info.peerId, `falha no ciclo de qualidade adaptativa: ${this.errorMessage(cause)}`);
+        }
+      }
+    } finally {
+      this.adaptiveQualityCycleRunning = false;
+    }
+  }
+
+  private resolveAdaptiveLevel(state: PeerState, recommended: AdaptiveQualityLevel): AdaptiveQualityLevel {
+    const current = state.adaptiveQuality.level;
+    const currentRank = ADAPTIVE_QUALITY_ORDER.indexOf(current);
+    const recommendedRank = ADAPTIVE_QUALITY_ORDER.indexOf(recommended);
+    if (recommended === current) {
+      state.adaptiveCandidate = recommended;
+      state.adaptiveCandidateCount = 0;
+      return current;
+    }
+
+    if (state.adaptiveCandidate !== recommended) {
+      state.adaptiveCandidate = recommended;
+      state.adaptiveCandidateCount = 1;
+    } else {
+      state.adaptiveCandidateCount += 1;
+    }
+
+    if (recommendedRank > currentRank) {
+      const required = recommended === 'critical' ? 1 : 2;
+      if (state.adaptiveCandidateCount < required) return current;
+      state.adaptiveCandidateCount = 0;
+      return recommended;
+    }
+
+    if (state.adaptiveCandidateCount < 4) return current;
+    state.adaptiveCandidateCount = 0;
+    return ADAPTIVE_QUALITY_ORDER[Math.max(0, currentRank - 1)];
+  }
+
+  private async applyAdaptiveSenderParameters(state: PeerState) {
+    const tasks: Promise<void>[] = [];
+    for (const slot of Object.keys(state.senders) as Array<keyof SenderSlots>) {
+      const sender = state.senders[slot];
+      if (sender) tasks.push(this.applySenderPolicy(state, slot, sender));
+    }
+    await Promise.all(tasks);
+  }
+
+  private async applySenderPolicy(state: PeerState, slot: keyof SenderSlots, sender: RTCRtpSender) {
+    if (slot === 'microphone' || slot === 'screenAudio') {
+      await this.applyAudioSenderParameters(state, slot, sender);
+      return;
+    }
+    await this.applyAdaptiveVideoSenderParameters(state, slot, sender);
+  }
+
+  private async applyAudioSenderParameters(state: PeerState, slot: 'microphone' | 'screenAudio', sender: RTCRtpSender) {
+    const policyKey = `${sender.track?.id ?? 'none'}:audio:high:${AUDIO_MAX_BITRATE_BPS}`;
+    if (state.senderPolicyKeys[slot] === policyKey) return;
     try {
       const parameters = sender.getParameters();
       parameters.encodings ??= [{}];
       if (parameters.encodings.length === 0) parameters.encodings.push({});
-      parameters.encodings[0].maxBitrate = this.screenBitrateKbps * 1000;
-      if (this.screenShareMetadata?.targetFps) parameters.encodings[0].maxFramerate = this.screenShareMetadata.targetFps;
-      parameters.degradationPreference = 'maintain-resolution';
+      const encoding = parameters.encodings[0] as ExtendedEncodingParameters;
+      encoding.maxBitrate = AUDIO_MAX_BITRATE_BPS;
+      encoding.priority = 'high';
       await sender.setParameters(parameters);
-      this.log(state.info.peerId, `screenVideo encoding: maxBitrate=${this.screenBitrateKbps}Kbps maxFps=${this.screenShareMetadata?.targetFps ?? 'n/d'}`);
+      state.senderPolicyKeys[slot] = policyKey;
+      this.log(state.info.peerId, `${slot} prioridade=high maxBitrate=${Math.round(AUDIO_MAX_BITRATE_BPS / 1000)}Kbps`);
     } catch (cause) {
-      this.log(state.info.peerId, `falha ajustando bitrate da tela: ${this.errorMessage(cause)}`);
+      this.log(state.info.peerId, `falha priorizando ${slot}: ${this.errorMessage(cause)}`);
+    }
+  }
+
+  private async applyAdaptiveVideoSenderParameters(state: PeerState, slot: 'camera' | 'screenVideo', sender: RTCRtpSender) {
+    try {
+      const profile = this.adaptiveQualityEnabled ? ADAPTIVE_QUALITY_PROFILES[state.adaptiveQuality.level] : ADAPTIVE_QUALITY_PROFILES.excellent;
+      const baselineKbps = slot === 'screenVideo' ? this.screenBitrateKbps : CAMERA_BASELINE_BITRATE_KBPS;
+      const sourceFps = slot === 'screenVideo' ? (this.screenShareMetadata?.targetFps ?? 30) : 30;
+      const policyKey = `${sender.track?.id ?? 'none'}:${state.adaptiveQuality.level}:${baselineKbps}:${sourceFps}:${profile.bitrateFactor}:${profile.maxFps}:${profile.scaleResolutionDownBy}`;
+      if (state.senderPolicyKeys[slot] === policyKey) return;
+      const parameters = sender.getParameters();
+      parameters.encodings ??= [{}];
+      if (parameters.encodings.length === 0) parameters.encodings.push({});
+      const encoding = parameters.encodings[0] as ExtendedEncodingParameters;
+      const minBitrateKbps = slot === 'screenVideo' ? 250 : 180;
+      encoding.maxBitrate = Math.max(minBitrateKbps, Math.round(baselineKbps * profile.bitrateFactor)) * 1000;
+      encoding.maxFramerate = Math.min(sourceFps, profile.maxFps);
+      encoding.scaleResolutionDownBy = profile.scaleResolutionDownBy;
+      encoding.priority = profile.badConnection ? 'very-low' : 'low';
+      parameters.degradationPreference = 'balanced';
+      await sender.setParameters(parameters);
+      state.senderPolicyKeys[slot] = policyKey;
+      this.log(state.info.peerId, `${slot} adaptive=${state.adaptiveQuality.level} maxBitrate=${Math.round((encoding.maxBitrate ?? 0) / 1000)}Kbps maxFps=${encoding.maxFramerate ?? 'n/d'} scale=${encoding.scaleResolutionDownBy ?? 1}`);
+    } catch (cause) {
+      this.log(state.info.peerId, `falha ajustando ${slot} adaptativamente: ${this.errorMessage(cause)}`);
     }
   }
 

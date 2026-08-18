@@ -1,15 +1,26 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
+import {
+  DEFAULT_INVITE_TTL_MINUTES,
+  FixedWindowRateLimiter,
+  MAX_SIGNALING_MESSAGE_BYTES,
+  SocketRateLimiter,
+  getRawDataSize,
+  normalizeInviteTtl,
+  randomId,
+  randomToken,
+  requestIdentity,
+  tokenDigest,
+  tokenMatches,
+  validateClientMessage,
+} from './security.mjs';
 
 const RECONNECTING_AFTER_MS = 0;
 const DISCONNECTED_AFTER_MS = 8000;
 const REMOVE_AFTER_MS = 38000;
 const JOIN_REQUEST_TIMEOUT_MS = 30000;
 
-function randomToken(bytes = 24) {
-  return randomBytes(bytes).toString('base64url');
-}
 
 function hashPin(pin) {
   return createHash('sha256').update(String(pin)).digest();
@@ -55,10 +66,24 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
+function writeSecureHeaders(res, extra = {}) {
+  const headers = {
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'x-frame-options': 'DENY',
+    ...extra,
+  };
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+}
+
 export async function startSignalingServer({ host = '127.0.0.1', port = 0, initialRoom, logger = () => {} } = {}) {
   const rooms = new Map();
   const clients = new Map();
   const pendingBySocket = new Map();
+  const socketRateLimiter = new SocketRateLimiter();
+  const connectionRateLimiter = new FixedWindowRateLimiter({ limit: 60, windowMs: 60_000, maxEntries: 512 });
+  const httpInviteRateLimiter = new FixedWindowRateLimiter({ limit: 120, windowMs: 60_000, maxEntries: 512 });
 
   if (!initialRoom) throw new Error('A configuração inicial da sala é obrigatória.');
 
@@ -68,6 +93,9 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
   const pin = cleanPin(initialRoom.pin || '');
   if (!roomId || !roomName) throw new Error('Sala ou nome da sala inválido.');
 
+  const initialInviteToken = randomToken(32);
+  const initialHostSecret = randomToken(32);
+  const inviteTtlMinutes = normalizeInviteTtl(initialRoom.inviteTtlMinutes ?? DEFAULT_INVITE_TTL_MINUTES);
   const room = {
     roomId,
     name: roomName,
@@ -76,8 +104,12 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
     pinHash: pin ? hashPin(pin) : null,
     approvalRequired: Boolean(initialRoom.approvalRequired),
     inviteEnabled: true,
-    inviteToken: randomToken(18),
-    hostSecret: randomToken(24),
+    inviteTokenDigest: tokenDigest(initialInviteToken),
+    inviteTtlMinutes,
+    inviteExpiresAt: Date.now() + inviteTtlMinutes * 60_000,
+    inviteTimer: null,
+    hostSecretDigest: tokenDigest(initialHostSecret),
+    hostSecretConsumed: false,
     hostPeerId: null,
     participants: new Map(),
     pending: new Map(),
@@ -89,6 +121,7 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
   }
 
   function publicRoom(currentRoom) {
+    const inviteActive = currentRoom.inviteEnabled && currentRoom.inviteExpiresAt > Date.now();
     return {
       roomId: currentRoom.roomId,
       name: currentRoom.name,
@@ -96,7 +129,9 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       locked: currentRoom.locked,
       pinRequired: Boolean(currentRoom.pinHash),
       approvalRequired: currentRoom.approvalRequired,
-      inviteEnabled: currentRoom.inviteEnabled,
+      inviteEnabled: inviteActive,
+      inviteExpiresAt: inviteActive ? currentRoom.inviteExpiresAt : null,
+      inviteTtlMinutes: currentRoom.inviteTtlMinutes,
       hostPeerId: currentRoom.hostPeerId,
     };
   }
@@ -130,6 +165,57 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
   function broadcastRoomState(currentRoom) {
     broadcast(currentRoom, { type: 'room-state', room: publicRoom(currentRoom) });
   }
+
+  function notifyInviteExpired(currentRoom) {
+    const hostParticipant = currentRoom.hostPeerId ? currentRoom.participants.get(currentRoom.hostPeerId) : null;
+    if (hostParticipant?.presence === 'online' && hostParticipant.ws) send(hostParticipant.ws, { type: 'invite-updated', enabled: false, reason: 'expired' });
+  }
+
+  function scheduleInviteExpiry(currentRoom) {
+    if (currentRoom.inviteTimer) clearTimeout(currentRoom.inviteTimer);
+    currentRoom.inviteTimer = null;
+    if (!currentRoom.inviteEnabled || currentRoom.inviteExpiresAt <= Date.now()) return;
+    currentRoom.inviteTimer = setTimeout(() => {
+      if (!currentRoom.inviteEnabled || currentRoom.inviteExpiresAt > Date.now()) return;
+      invalidateInviteState(currentRoom);
+      notifyInviteExpired(currentRoom);
+      broadcastRoomState(currentRoom);
+      logger(`[invite] convite expirou para ${currentRoom.roomId}`);
+    }, Math.max(1, currentRoom.inviteExpiresAt - Date.now()));
+    currentRoom.inviteTimer.unref?.();
+  }
+
+  function issueInvite(currentRoom) {
+    const token = randomToken(32);
+    currentRoom.inviteTokenDigest = tokenDigest(token);
+    currentRoom.inviteEnabled = true;
+    currentRoom.inviteExpiresAt = Date.now() + currentRoom.inviteTtlMinutes * 60_000;
+    scheduleInviteExpiry(currentRoom);
+    return { token, expiresAt: currentRoom.inviteExpiresAt };
+  }
+
+  function invalidateInviteState(currentRoom) {
+    if (currentRoom.inviteTimer) clearTimeout(currentRoom.inviteTimer);
+    currentRoom.inviteTimer = null;
+    currentRoom.inviteEnabled = false;
+    currentRoom.inviteTokenDigest = null;
+    currentRoom.inviteExpiresAt = 0;
+  }
+
+  function isInviteValid(currentRoom, token) {
+    if (!currentRoom.inviteEnabled || currentRoom.inviteExpiresAt <= Date.now()) {
+      if (currentRoom.inviteEnabled) {
+        invalidateInviteState(currentRoom);
+        notifyInviteExpired(currentRoom);
+        broadcastRoomState(currentRoom);
+        logger(`[invite] convite expirou para ${currentRoom.roomId}`);
+      }
+      return false;
+    }
+    return tokenMatches(token, currentRoom.inviteTokenDigest);
+  }
+
+  scheduleInviteExpiry(room);
 
   function clearParticipantTimers(participant) {
     if (participant.disconnectedTimer) clearTimeout(participant.disconnectedTimer);
@@ -202,14 +288,15 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       return null;
     }
 
-    const peerId = randomUUID();
+    const peerId = randomId(18);
+    const sessionToken = randomToken(32);
     const participant = {
       peerId,
       name,
       room: currentRoom,
       isHost,
       presence: 'online',
-      sessionToken: randomToken(24),
+      sessionTokenDigest: tokenDigest(sessionToken),
       ws,
       disconnectedTimer: null,
       removeTimer: null,
@@ -227,7 +314,7 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       peers: onlinePeers(currentRoom, peerId),
       room: publicRoom(currentRoom),
       participants: participantList(currentRoom),
-      sessionToken: participant.sessionToken,
+      sessionToken,
     });
     broadcast(currentRoom, { type: 'peer-joined', peer }, peerId);
     broadcastRoomState(currentRoom);
@@ -237,7 +324,7 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
 
   function tryResume(ws, currentRoom, resumeToken) {
     if (!resumeToken) return false;
-    const participant = [...currentRoom.participants.values()].find((candidate) => candidate.sessionToken === resumeToken);
+    const participant = [...currentRoom.participants.values()].find((candidate) => tokenMatches(resumeToken, candidate.sessionTokenDigest));
     if (!participant) return false;
 
     clearParticipantTimers(participant);
@@ -245,6 +332,8 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       clients.delete(participant.ws);
       try { participant.ws.close(4001, 'session-resumed-elsewhere'); } catch { /* noop */ }
     }
+    const nextSessionToken = randomToken(32);
+    participant.sessionTokenDigest = tokenDigest(nextSessionToken);
     participant.ws = ws;
     participant.presence = 'online';
     clients.set(ws, participant);
@@ -256,10 +345,10 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       peers: onlinePeers(currentRoom, participant.peerId),
       room: publicRoom(currentRoom),
       participants: participantList(currentRoom),
-      sessionToken: participant.sessionToken,
+      sessionToken: nextSessionToken,
     });
     broadcast(currentRoom, { type: 'participant-state', participant: publicParticipant(participant) }, participant.peerId);
-    logger(`[resume] ${participant.name} (${participant.peerId.slice(0, 8)}) retomou ${currentRoom.roomId}`);
+    logger(`[resume] ${participant.name} (${participant.peerId.slice(0, 8)}) retomou ${currentRoom.roomId}; token de sessão rotacionado`);
     return true;
   }
 
@@ -279,18 +368,22 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
 
     if (tryResume(ws, currentRoom, String(message.resumeToken || ''))) return;
 
-    const isHost = Boolean(message.hostSecret && message.hostSecret === currentRoom.hostSecret);
+    const isHost = Boolean(!currentRoom.hostSecretConsumed && message.hostSecret && tokenMatches(message.hostSecret, currentRoom.hostSecretDigest));
     if (isHost) {
       if (currentRoom.hostPeerId && currentRoom.participants.has(currentRoom.hostPeerId)) {
         send(ws, { type: 'error', code: 'HOST_EXISTS', message: 'O host desta sala já está conectado.' });
         return;
       }
-      acceptJoin(ws, currentRoom, name, { isHost: true });
+      const joined = acceptJoin(ws, currentRoom, name, { isHost: true });
+      if (joined) {
+        currentRoom.hostSecretConsumed = true;
+        currentRoom.hostSecretDigest = null;
+      }
       return;
     }
 
-    if (!currentRoom.inviteEnabled || !message.inviteToken || message.inviteToken !== currentRoom.inviteToken) {
-      send(ws, { type: 'error', code: 'INVALID_INVITE', message: 'Este convite não é mais válido. Solicite um novo convite ao host.' });
+    if (!message.inviteToken || !isInviteValid(currentRoom, message.inviteToken)) {
+      send(ws, { type: 'error', code: currentRoom.inviteEnabled ? 'INVALID_INVITE' : 'INVITE_EXPIRED', message: 'Este convite expirou, foi invalidado ou foi substituído. Solicite um novo convite ao host.' });
       return;
     }
     if (currentRoom.locked) {
@@ -317,7 +410,7 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       return;
     }
 
-    const requestId = randomToken(12);
+    const requestId = randomId(18);
     const pending = { requestId, name, ws, room: currentRoom, timer: null };
     pending.timer = setTimeout(() => {
       if (!currentRoom.pending.has(requestId)) return;
@@ -336,15 +429,19 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
 
   function relaySignal(ws, target, data) {
     const client = clients.get(ws);
-    if (!client || typeof target !== 'string' || !data || typeof data !== 'object') return;
+    if (!client || target === client.peerId) return;
     const targetClient = client.room.participants.get(target);
-    if (!targetClient || targetClient.presence !== 'online' || !targetClient.ws) return;
+    if (!targetClient || targetClient.room !== client.room || targetClient.presence !== 'online' || !targetClient.ws) {
+      send(ws, { type: 'error', code: 'INVALID_SIGNAL_TARGET', message: 'Destino de signaling inválido.' });
+      return;
+    }
+    // O campo `from` é sempre atribuído pelo servidor a partir da sessão autenticada.
     send(targetClient.ws, { type: 'signal', from: client.peerId, data });
   }
 
   function requireHost(ws) {
     const client = clients.get(ws);
-    if (!client || !client.isHost) {
+    if (!client || !client.isHost || client.room.hostPeerId !== client.peerId) {
       send(ws, { type: 'error', code: 'HOST_ONLY', message: 'Apenas o host pode executar esta ação.' });
       return null;
     }
@@ -372,6 +469,13 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       if (Object.hasOwn(changes, 'pin')) {
         const nextPin = cleanPin(changes.pin || '');
         currentRoom.pinHash = nextPin ? hashPin(nextPin) : null;
+      }
+      if (Object.hasOwn(changes, 'inviteTtlMinutes')) {
+        currentRoom.inviteTtlMinutes = normalizeInviteTtl(changes.inviteTtlMinutes);
+        if (currentRoom.inviteEnabled) {
+          const nextInvite = issueInvite(currentRoom);
+          send(ws, { type: 'invite-updated', enabled: true, inviteToken: nextInvite.token, expiresAt: nextInvite.expiresAt });
+        }
       }
       broadcastRoomState(currentRoom);
       logger(`[room] ${currentRoom.roomId} atualizada por ${hostClient.name}`);
@@ -422,9 +526,8 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
   function regenerateInvite(ws) {
     const hostClient = requireHost(ws);
     if (!hostClient) return;
-    hostClient.room.inviteToken = randomToken(18);
-    hostClient.room.inviteEnabled = true;
-    send(ws, { type: 'invite-updated', enabled: true, inviteToken: hostClient.room.inviteToken });
+    const nextInvite = issueInvite(hostClient.room);
+    send(ws, { type: 'invite-updated', enabled: true, inviteToken: nextInvite.token, expiresAt: nextInvite.expiresAt });
     broadcastRoomState(hostClient.room);
     logger(`[invite] convite regenerado para ${hostClient.room.roomId}`);
   }
@@ -432,8 +535,7 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
   function invalidateInvite(ws) {
     const hostClient = requireHost(ws);
     if (!hostClient) return;
-    hostClient.room.inviteToken = randomToken(18);
-    hostClient.room.inviteEnabled = false;
+    invalidateInviteState(hostClient.room);
     send(ws, { type: 'invite-updated', enabled: false });
     broadcastRoomState(hostClient.room);
     logger(`[invite] convite invalidado para ${hostClient.room.roomId}`);
@@ -450,20 +552,64 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
     removeParticipant(participant.room, participant, 'explicit-leave');
   }
 
+  function rejectRateLimit(ws, bucket, retryAfterMs, violations) {
+    send(ws, { type: 'error', code: 'RATE_LIMITED', message: `Muitas mensagens (${bucket}). Tente novamente em ${Math.max(1, Math.ceil(retryAfterMs / 1000))}s.` });
+    if (violations >= 4) {
+      logger(`[security] WebSocket encerrado por abuso de rate limit (${bucket})`);
+      try { ws.close(4008, 'rate-limit'); } catch { /* noop */ }
+    }
+  }
+
+  function consumeMessageRate(ws, messageType) {
+    const general = socketRateLimiter.consume(ws, 'general', { limit: 300, windowMs: 10_000 });
+    if (!general.allowed) {
+      rejectRateLimit(ws, 'geral', general.retryAfterMs, general.violations);
+      return false;
+    }
+    const policy = messageType === 'signal'
+      ? { bucket: 'signal', limit: 240, windowMs: 10_000 }
+      : messageType === 'join'
+        ? { bucket: 'join', limit: 8, windowMs: 60_000 }
+        : { bucket: 'control', limit: 40, windowMs: 60_000 };
+    const result = socketRateLimiter.consume(ws, policy.bucket, policy);
+    if (!result.allowed) {
+      rejectRateLimit(ws, policy.bucket, result.retryAfterMs, result.violations);
+      return false;
+    }
+    return true;
+  }
+
   function handleMessage(ws, raw) {
-    let message;
-    try {
-      message = JSON.parse(raw.toString());
-    } catch {
-      send(ws, { type: 'error', code: 'INVALID_MESSAGE', message: 'Mensagem inválida.' });
+    const size = getRawDataSize(raw);
+    if (size > MAX_SIGNALING_MESSAGE_BYTES) {
+      logger(`[security] payload WebSocket rejeitado: ${size} bytes`);
+      try { ws.close(1009, 'message-too-large'); } catch { /* noop */ }
       return;
     }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw.toString());
+    } catch {
+      send(ws, { type: 'error', code: 'INVALID_MESSAGE', message: 'JSON inválido.' });
+      return;
+    }
+
+    let message;
+    try {
+      message = validateClientMessage(parsed);
+    } catch (error) {
+      send(ws, { type: 'error', code: 'INVALID_MESSAGE', message: error instanceof Error ? error.message : 'Mensagem inválida.' });
+      return;
+    }
+
+    if (!consumeMessageRate(ws, message.type)) return;
 
     if (message.type === 'join') return joinRoom(ws, message);
     if (message.type === 'signal') return relaySignal(ws, message.target, message.data);
     if (message.type === 'room-update') return updateRoom(ws, message.changes);
     if (message.type === 'kick') return kickParticipant(ws, message.peerId);
-    if (message.type === 'join-decision') return decideJoin(ws, message.requestId, Boolean(message.approved));
+    if (message.type === 'join-decision') return decideJoin(ws, message.requestId, message.approved);
     if (message.type === 'invite-regenerate') return regenerateInvite(ws);
     if (message.type === 'invite-invalidate') return invalidateInvite(ws);
     if (message.type === 'leave') return explicitLeave(ws);
@@ -473,23 +619,31 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
     const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
     if (requestUrl.pathname === '/health') {
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+      writeSecureHeaders(res, { 'content-type': 'application/json; charset=utf-8' });
+      res.writeHead(200);
       res.end(JSON.stringify({
         ok: true,
         rooms: rooms.size,
         connections: clients.size,
-        room: publicRoom(room),
-        participants: participantList(room),
       }));
       return;
     }
 
     if (requestUrl.pathname === '/join') {
+      const identity = requestIdentity(req);
+      const inviteRate = httpInviteRateLimiter.consume(identity);
+      if (!inviteRate.allowed) {
+        writeSecureHeaders(res, { 'content-type': 'text/plain; charset=utf-8', 'retry-after': String(Math.max(1, Math.ceil(inviteRate.retryAfterMs / 1000))) });
+        res.writeHead(429);
+        res.end('Muitas tentativas. Tente novamente mais tarde.');
+        return;
+      }
       const requestedRoom = cleanRoom(requestUrl.searchParams.get('room'));
       const token = String(requestUrl.searchParams.get('token') || '');
       const targetRoom = rooms.get(requestedRoom);
-      if (!targetRoom || !targetRoom.inviteEnabled || token !== targetRoom.inviteToken) {
-        res.writeHead(410, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' });
+      if (!targetRoom || !isInviteValid(targetRoom, token)) {
+        writeSecureHeaders(res, { 'content-type': 'text/html; charset=utf-8', 'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" });
+        res.writeHead(410);
         res.end('<!doctype html><meta charset="utf-8"><title>Convite inválido</title><style>body{font-family:system-ui;background:#0b0d12;color:#eef1f7;display:grid;place-items:center;min-height:100vh;margin:0}.card{max-width:460px;padding:32px;border:1px solid #2a3040;border-radius:18px;background:#141822;text-align:center}p{color:#98a3b8}</style><div class="card"><h1>Convite inválido</h1><p>Este convite expirou ou foi substituído pelo host.</p></div>');
         return;
       }
@@ -498,13 +652,13 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       const protocol = forwardedProto === 'https' ? 'https' : 'http';
       const hostHeader = String(req.headers.host || '').replace(/[^a-zA-Z0-9.:[\]-]/g, '');
       const publicBase = `${protocol}://${hostHeader}`;
-      const deepLink = `discordy://join?server=${encodeURIComponent(publicBase)}&room=${encodeURIComponent(targetRoom.roomId)}&token=${encodeURIComponent(targetRoom.inviteToken)}&v=2`;
+      const deepLink = `discordy://join?server=${encodeURIComponent(publicBase)}&room=${encodeURIComponent(targetRoom.roomId)}&token=${encodeURIComponent(token)}&v=2`;
 
-      res.writeHead(200, {
+      writeSecureHeaders(res, {
         'content-type': 'text/html; charset=utf-8',
-        'cache-control': 'no-store',
-        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
       });
+      res.writeHead(200);
       res.end(`<!doctype html>
 <html lang="pt-BR">
 <meta charset="utf-8">
@@ -516,11 +670,12 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       return;
     }
 
-    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+    writeSecureHeaders(res, { 'content-type': 'text/plain; charset=utf-8' });
+    res.writeHead(200);
     res.end('Discordy signaling server');
   });
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 256 * 1024 });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_SIGNALING_MESSAGE_BYTES, perMessageDeflate: false });
 
   server.on('upgrade', (req, socket, head) => {
     const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -528,11 +683,23 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+    const identity = requestIdentity(req);
+    const connectionRate = connectionRateLimiter.consume(identity);
+    if (!connectionRate.allowed) {
+      logger(`[security] upgrade WebSocket limitado para ${identity}`);
+      socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nRetry-After: 60\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      ws.securityIdentity = identity;
+      wss.emit('connection', ws, req);
+    });
   });
 
   wss.on('connection', (ws) => {
     ws.isAlive = true;
+    logger(`[security] WebSocket aceito de ${ws.securityIdentity || 'unknown'}`);
     ws.on('pong', () => { ws.isAlive = true; });
     ws.on('message', (raw) => handleMessage(ws, raw));
     ws.on('close', () => markTransportLost(ws));
@@ -568,10 +735,12 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, initi
     roomId: room.roomId,
     roomName: room.name,
     maxParticipants: room.maxParticipants,
-    hostSecret: room.hostSecret,
-    inviteToken: room.inviteToken,
+    hostSecret: initialHostSecret,
+    inviteToken: initialInviteToken,
+    inviteExpiresAt: room.inviteExpiresAt,
     async close() {
       clearInterval(heartbeat);
+      if (room.inviteTimer) clearTimeout(room.inviteTimer);
       for (const pending of room.pending.values()) if (pending.timer) clearTimeout(pending.timer);
       for (const participant of room.participants.values()) clearParticipantTimers(participant);
       for (const ws of wss.clients) {

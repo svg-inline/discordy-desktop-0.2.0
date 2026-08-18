@@ -1,9 +1,9 @@
 {
   "name": "discordy-desktop",
-  "version": "0.8.0",
+  "version": "0.10.0",
   "private": true,
   "type": "module",
-  "description": "Discordy Desktop - Desktop Experience com tray, notificações nativas, atalhos globais, PTT em segundo plano, deep links e inicialização com Windows",
+  "description": "Discordy Desktop - Security hardening: invite tokens com expiração, rate limiting, validação rígida, proteção anti-spoofing, CSP e IPC/preload endurecidos",
   "main": "electron/main.mjs",
   "author": "Discordy",
   "license": "UNLICENSED",
@@ -12,7 +12,8 @@
     "build": "vite build",
     "start": "npm run build && electron .",
     "dist:win": "npm run build && electron-builder --win nsis portable",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:security": "node server/security.test.mjs"
   },
   "dependencies": {
     "react": "19.1.1",

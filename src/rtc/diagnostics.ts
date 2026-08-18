@@ -1,3 +1,4 @@
+import type { AdaptiveQualitySnapshot } from './adaptiveQuality';
 export type ConnectionRoute = 'direct' | 'nat' | 'turn' | 'unknown';
 
 export type VideoReceiveMetrics = {
@@ -29,6 +30,7 @@ export type PeerDiagnostics = {
   outboundCodecs: string[];
   inboundCodecs: string[];
   receivedVideo: VideoReceiveMetrics | null;
+  adaptiveQuality?: AdaptiveQualitySnapshot;
 };
 
 type ExtendedRTCStats = RTCStats & Record<string, unknown>;

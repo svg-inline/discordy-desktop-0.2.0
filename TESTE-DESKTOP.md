@@ -1,4 +1,118 @@
-# Teste remoto — Discordy Desktop 0.8.0
+# Teste remoto — Discordy Desktop 0.10.0
+
+## Adaptive Quality — 0.9.0
+
+### 1. Estado inicial
+
+1. Abra host e convidado.
+2. Entre na mesma sala.
+3. Abra **Diagnóstico WebRTC**.
+4. Confirme **Qualidade adaptativa** habilitada.
+5. Aguarde pelo menos 4 segundos.
+
+Esperado por peer:
+
+- nível de qualidade visível;
+- RTT e packet loss atualizados;
+- upload disponível quando fornecido pelo Chromium;
+- FPS/escala TX exibidos;
+- sem erros repetitivos em logs.
+
+### 2. Screen share 1080p60
+
+1. Inicie compartilhamento em `1080p60` com bitrate alto, por exemplo `8000 Kbps`.
+2. Confirme em conexão boa:
+   - `excellent` ou `good`;
+   - FPS alvo próximo do preset;
+   - escala `1.00x`.
+3. Limite artificialmente a conexão do transmissor/receptor ou introduza perda/latência.
+4. Aguarde algumas amostras.
+
+Esperado:
+
+```text
+loss/RTT/upload pioram
+        ↓
+nível cai
+        ↓
+bitrate de vídeo diminui
+FPS diminui
+scaleResolutionDownBy aumenta
+        ↓
+áudio continua ativo
+```
+
+### 3. Packet loss
+
+Introduza aproximadamente `3–8%` de packet loss.
+
+Esperado:
+
+- nível entra em `fair` ou `poor`;
+- painel mostra o motivo baseado em packet loss;
+- vídeo perde qualidade antes do áudio.
+
+Com perda acima de aproximadamente `12%`, o nível pode chegar a `critical`.
+
+### 4. RTT alto
+
+Simule latência crescente:
+
+```text
+150+ ms → pode cair para good
+250+ ms → fair
+400+ ms → poor
+700+ ms → critical
+```
+
+Validar que os thresholds são usados junto com loss/upload — o pior sinal prevalece.
+
+### 5. Recuperação
+
+1. Depois de degradar a conexão, remova a limitação.
+2. Observe o painel por pelo menos 20 segundos.
+
+Esperado:
+
+- não volta imediatamente para `excellent`;
+- exige múltiplas amostras estáveis;
+- recupera um nível por vez;
+- não fica alternando rapidamente entre níveis.
+
+### 6. Qualidade independente por peer
+
+Com 3 ou 4 participantes:
+
+1. deixe um peer em rede boa;
+2. limite apenas outro peer;
+3. compartilhe tela/câmera.
+
+Esperado:
+
+- cada `RTCPeerConnection` possui nível próprio;
+- peer ruim recebe sender com bitrate/FPS/resolução menores;
+- peer bom mantém qualidade superior.
+
+### 7. Prioridade do áudio
+
+Durante uma condição `poor` ou `critical`:
+
+- confirme microfone audível;
+- confirme que câmera/tela degradam;
+- logs devem registrar `microphone prioridade=high`;
+- sender de vídeo deve registrar parâmetros reduzidos.
+
+### 8. Desativar Adaptive Quality
+
+1. Desative **Qualidade adaptativa** no diagnóstico.
+2. Confirme que os senders voltam ao perfil máximo configurado.
+3. Reative a opção.
+4. Confirme retomada da coleta e adaptação automática.
+5. Reinicie o aplicativo e valide persistência da preferência.
+
+---
+
+# Histórico de testes — Discordy Desktop 0.10.0
 
 ## Desktop Experience — 0.8.0
 
@@ -665,3 +779,114 @@ Após validar o Chat P2P, repetir:
 - TURN fallback;
 - Network Diagnostics.
 
+
+# Segurança — 0.10.0
+
+## 45. Expiração do convite
+
+1. Crie uma sala com expiração de `15 min`.
+2. Confirme que a interface mostra a validade do convite.
+3. Para teste rápido em desenvolvimento, reduza temporariamente o TTL no servidor.
+4. Após expirar, tente usar o link antigo.
+5. Confirme `INVITE_EXPIRED`/convite inválido e que participantes já conectados continuam na sala.
+
+## 46. Regeneração e token antigo
+
+1. Copie o convite A.
+2. Regenerar o convite e copie B.
+3. A deve ser rejeitado imediatamente.
+4. B deve continuar válido até expirar ou ser invalidado.
+5. Confirme que o `roomId` não mudou.
+
+## 47. Host authorization
+
+1. Entre como convidado.
+2. Pelo DevTools em desenvolvimento ou cliente de teste, tente enviar `room-update`, `kick`, `join-decision`, `invite-regenerate` e `invite-invalidate`.
+3. O servidor deve responder `HOST_ONLY`.
+4. Confirme que nenhuma configuração da sala mudou.
+
+## 48. Peer spoofing
+
+1. Conecte três participantes A, B e C.
+2. Faça A enviar signaling para B.
+3. Confirme em B que `from` corresponde ao peerId real de A.
+4. Tente incluir manualmente um campo `from` no pacote enviado por A.
+5. A mensagem deve ser rejeitada pela validação rígida.
+6. Tente sinalizar para peer inexistente ou de outra sala; deve receber `INVALID_SIGNAL_TARGET`.
+
+## 49. Validação rígida
+
+Teste mensagens com:
+
+- tipo desconhecido;
+- campo extra;
+- `peerId` inválido;
+- SDP acima do limite;
+- ICE candidate malformado;
+- metadata de screen share fora dos limites;
+- PIN fora de `4–12` dígitos.
+
+Todas devem ser rejeitadas sem alterar estado da sala.
+
+## 50. Limite de payload
+
+1. Envie um frame WebSocket maior que `96 KiB`.
+2. A conexão deve ser recusada/fechada com limite de mensagem.
+3. Confirme que o processo do signaling continua saudável.
+
+## 51. Rate limiting
+
+1. Em um cliente de teste, dispare mais de 8 `join` em 60 s no mesmo socket.
+2. Confirme `RATE_LIMITED`.
+3. Repita violações até o limite de abuso.
+4. Confirme fechamento da conexão com código `4008`.
+5. Teste também rajada de `signal` e ações administrativas.
+
+## 52. Session token rotation
+
+1. Entre normalmente e registre apenas para teste o token de sessão recebido.
+2. Provoque perda do WebSocket e resume.
+3. Confirme que um novo token de sessão foi entregue.
+4. O token anterior não deve conseguir assumir novamente a sessão após a rotação.
+5. O `peerId` permanece o mesmo durante o resume legítimo.
+
+## 53. Deep link hardening
+
+Tente abrir:
+
+```text
+discordy://join?server=http://example.com&room=ROOM&token=TOKEN&v=2
+discordy://join?server=https://example.com&room=ROOM&token=curto&v=2
+discordy://evil?server=https://example.com
+discordy://join?server=https://user:pass@example.com&room=ROOM&token=TOKEN&v=2
+```
+
+Todos os casos inválidos devem ser ignorados/rejeitados. HTTP remoto não é permitido; HTTP só é aceito para loopback.
+
+## 54. Electron CSP / navegação
+
+1. No build empacotado, confirme que DevTools não abre.
+2. Tente `window.open()` para uma URL externa.
+3. Nenhuma nova BrowserWindow deve ser criada; links permitidos devem abrir no navegador padrão.
+4. Tente navegar o renderer para outra origem e confirme bloqueio.
+5. Confirme que `window.require`, `process` Node e `ipcRenderer` não estão disponíveis no renderer.
+
+## 55. IPC/preload
+
+1. Confirme que `window.discordy` contém somente métodos explicitamente expostos.
+2. Tente chamar IPC a partir de outro WebContents/frame em teste de desenvolvimento.
+3. O processo principal deve rejeitar a origem.
+4. Teste payloads excessivos no clipboard/notificação e confirme truncamento/limite.
+
+## 56. Regressão pós-hardening
+
+Após os testes de segurança, repetir:
+
+- criar/entrar/reconectar sala;
+- Room Management;
+- áudio, câmera e PTT;
+- screen share e múltiplas transmissões;
+- Chat P2P;
+- TURN fallback;
+- Adaptive Quality;
+- tray e deep link legítimo `discordy://`.

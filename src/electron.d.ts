@@ -13,6 +13,7 @@ type HostStartOptions = {
   maxParticipants: 2 | 3 | 4;
   pin?: string;
   approvalRequired?: boolean;
+  inviteTtlMinutes?: 15 | 30 | 60 | 360 | 1440;
 };
 
 type HostStartResult = {
@@ -27,6 +28,7 @@ type HostStartResult = {
   };
   hostSecret: string;
   inviteToken: string;
+  inviteExpiresAt: number;
 };
 
 type HostStatus = {
