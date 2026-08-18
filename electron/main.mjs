@@ -7,6 +7,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLOUDFLARED_DOWNLOAD_URL = 'https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/';
 let mainWindow = null;
 let pendingDeepLink = null;
+let pendingDisplaySelection = null;
 
 function sendToRenderer(channel, payload) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -61,27 +62,36 @@ function configureMediaPermissions() {
   const ses = session.defaultSession;
   ses.setPermissionCheckHandler((webContents, permission) => {
     if (!mainWindow || webContents?.id !== mainWindow.webContents.id) return false;
-    return permission === 'media';
+    return permission === 'media' || permission === 'speaker-selection';
   });
 
   ses.setPermissionRequestHandler((webContents, permission, callback) => {
-    callback(Boolean(mainWindow && webContents.id === mainWindow.webContents.id && permission === 'media'));
+    callback(Boolean(mainWindow && webContents.id === mainWindow.webContents.id && (permission === 'media' || permission === 'speaker-selection')));
   });
 
-  ses.setDisplayMediaRequestHandler(async (_request, callback) => {
+  ses.setDisplayMediaRequestHandler(async (request, callback) => {
     try {
+      const selection = pendingDisplaySelection;
+      pendingDisplaySelection = null;
+      if (!selection?.sourceId) return callback({});
+
       const sources = await desktopCapturer.getSources({
         types: ['screen', 'window'],
         thumbnailSize: { width: 0, height: 0 },
         fetchWindowIcons: false,
       });
-      const firstScreen = sources.find((source) => source.id.startsWith('screen:')) || sources[0];
-      if (!firstScreen) return callback({});
-      callback({ video: firstScreen, audio: 'loopback' });
+      const source = sources.find((candidate) => candidate.id === selection.sourceId);
+      if (!source) return callback({});
+
+      const streams = { video: source };
+      if (selection.includeAudio && request.audioRequested && process.platform === 'win32') {
+        streams.audio = 'loopback';
+      }
+      callback(streams);
     } catch {
       callback({});
     }
-  }, { useSystemPicker: true });
+  });
 }
 
 function createWindow() {
@@ -122,6 +132,31 @@ function createWindow() {
     void mainWindow.loadFile(join(__dirname, '..', 'dist', 'index.html'));
   }
 }
+
+
+ipcMain.handle('screen:list-sources', async (event) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) throw new Error('Renderer não autorizado.');
+  const sources = await desktopCapturer.getSources({
+    types: ['screen', 'window'],
+    thumbnailSize: { width: 360, height: 210 },
+    fetchWindowIcons: false,
+  });
+  return sources.map((source) => ({
+    id: source.id,
+    name: source.name,
+    type: source.id.startsWith('screen:') ? 'monitor' : 'window',
+    thumbnail: source.thumbnail.isEmpty() ? '' : source.thumbnail.toDataURL(),
+    displayId: source.display_id || null,
+  }));
+});
+ipcMain.on('screen:select-source', (event, payload) => {
+  if (!mainWindow || event.sender.id !== mainWindow.webContents.id) { event.returnValue = false; return; }
+  pendingDisplaySelection = {
+    sourceId: String(payload?.sourceId || ''),
+    includeAudio: Boolean(payload?.includeAudio),
+  };
+  event.returnValue = Boolean(pendingDisplaySelection.sourceId);
+});
 
 ipcMain.handle('cloudflared:check', async () => await hostService.checkCloudflared());
 ipcMain.handle('cloudflared:open-download', async () => {

@@ -21,6 +21,14 @@ type HostStatus = {
   publicUrl?: string;
 };
 
+type ScreenSourceInfo = {
+  id: string;
+  name: string;
+  type: 'monitor' | 'window';
+  thumbnail: string;
+  displayId: string | null;
+};
+
 declare global {
   interface Window {
     discordy: {
@@ -34,6 +42,10 @@ declare global {
         stop(): Promise<boolean>;
         onStatus(callback: (status: HostStatus) => void): () => void;
         onLog(callback: (line: string) => void): () => void;
+      };
+      screen: {
+        listSources(): Promise<ScreenSourceInfo[]>;
+        selectSource(sourceId: string, includeAudio: boolean): boolean;
       };
       clipboard: {
         writeText(text: string): Promise<boolean>;

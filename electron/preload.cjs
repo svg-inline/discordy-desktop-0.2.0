@@ -20,6 +20,10 @@ contextBridge.exposeInMainWorld('discordy', {
       return () => ipcRenderer.removeListener('host:log', handler);
     },
   },
+  screen: {
+    listSources: () => ipcRenderer.invoke('screen:list-sources'),
+    selectSource: (sourceId, includeAudio) => ipcRenderer.sendSync('screen:select-source', { sourceId, includeAudio }),
+  },
   clipboard: {
     writeText: (text) => ipcRenderer.invoke('clipboard:write-text', text),
   },

@@ -1,15 +1,20 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { RemoteVideo } from './components/RemoteVideo';
+import { ScreenShareTile } from './components/ScreenShareTile';
 import { createInvite, createRoomCode, parseInvite } from './lib/invite';
 import { SignalingClient } from './lib/signaling';
 import type { SignalingState } from './lib/signaling';
 import { PeerManager } from './rtc/PeerManager';
 import type { PeerDiagnostics } from './rtc/diagnostics';
-import type { RemotePeer, ServerMessage } from './lib/types';
+import type { RemotePeer, ScreenShareMetadata, ServerMessage } from './lib/types';
+import { VoiceMediaController } from './media/VoiceMediaController';
+import type { MediaDeviceCatalog, SensitivityMode, VoiceActivitySnapshot, VoiceInputMode } from './media/VoiceMediaController';
+import { SCREEN_QUALITY_PRESETS, ScreenShareController } from './media/ScreenShareController';
+import type { ScreenQualityPreset, ScreenSourceInfo } from './media/ScreenShareController';
 
 const DEFAULT_STUN = typeof import.meta.env.VITE_STUN_URL === 'string' ? import.meta.env.VITE_STUN_URL : 'stun:stun.l.google.com:19302';
 const MAX_PARTICIPANTS = 4;
-const APP_VERSION = '0.2.3';
+const APP_VERSION = '0.4.0';
 
 type HomeMode = 'home' | 'host' | 'join';
 type ThemeMode = 'dark' | 'onyx';
@@ -109,7 +114,40 @@ function App() {
   const [status, setStatus] = useState('Pronto');
   const [error, setError] = useState<string | null>(null);
   const [micEnabled, setMicEnabled] = useState(true);
+  const [deafened, setDeafened] = useState(false);
+  const [cameraStream, setCameraStream] = useState<MediaStream | null>(null);
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null);
+  const [screenMetadata, setScreenMetadata] = useState<ScreenShareMetadata | null>(null);
+  const [screenPickerOpen, setScreenPickerOpen] = useState(false);
+  const [screenSources, setScreenSources] = useState<ScreenSourceInfo[]>([]);
+  const [screenSourcesLoading, setScreenSourcesLoading] = useState(false);
+  const [screenQuality, setScreenQuality] = useState<ScreenQualityPreset>(() => {
+    const value = localStorage.getItem('discordy:screen-quality');
+    return value === '720p30' || value === '1080p60' ? value : '1080p30';
+  });
+  const [screenBitrateKbps, setScreenBitrateKbps] = useState(() => {
+    const value = Number(localStorage.getItem('discordy:screen-bitrate') || '4500');
+    return Number.isFinite(value) ? Math.max(500, Math.min(20000, value)) : 4500;
+  });
+  const [screenSystemAudio, setScreenSystemAudio] = useState(() => localStorage.getItem('discordy:screen-system-audio') !== 'false');
+  const [expandedScreenKey, setExpandedScreenKey] = useState<string | null>(null);
+  const [showMediaSettings, setShowMediaSettings] = useState(false);
+  const [mediaDevices, setMediaDevices] = useState<MediaDeviceCatalog>({ audioInputs: [], audioOutputs: [], videoInputs: [] });
+  const [microphoneDeviceId, setMicrophoneDeviceId] = useState(() => localStorage.getItem('discordy:microphone-device') || '');
+  const [outputDeviceId, setOutputDeviceId] = useState(() => localStorage.getItem('discordy:output-device') || '');
+  const [cameraDeviceId, setCameraDeviceId] = useState(() => localStorage.getItem('discordy:camera-device') || '');
+  const [inputMode, setInputMode] = useState<VoiceInputMode>(() => localStorage.getItem('discordy:input-mode') === 'push-to-talk' ? 'push-to-talk' : 'voice-activity');
+  const [sensitivityMode, setSensitivityMode] = useState<SensitivityMode>(() => localStorage.getItem('discordy:sensitivity-mode') === 'manual' ? 'manual' : 'automatic');
+  const [manualSensitivityDb, setManualSensitivityDb] = useState(() => {
+    const stored = Number(localStorage.getItem('discordy:sensitivity-db') || '-48');
+    return Number.isFinite(stored) ? Math.max(-80, Math.min(-20, stored)) : -48;
+  });
+  const [pushToMuteEnabled, setPushToMuteEnabled] = useState(() => localStorage.getItem('discordy:push-to-mute') !== 'false');
+  const [pushToTalkPressed, setPushToTalkPressed] = useState(false);
+  const [pushToMutePressed, setPushToMutePressed] = useState(false);
+  const [voiceActivity, setVoiceActivity] = useState<VoiceActivitySnapshot>({ levelDb: -96, thresholdDb: -48, speaking: false, transmitting: false });
+  const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>({});
+  const [remoteSpeaking, setRemoteSpeaking] = useState<Record<string, boolean>>({});
   const [remotePeers, setRemotePeers] = useState<RemotePeer[]>([]);
   const [cloudflared, setCloudflared] = useState<{ installed: boolean; version: string | null } | null>(null);
   const [technicalLogs, setTechnicalLogs] = useState<string[]>([]);
@@ -122,7 +160,10 @@ function App() {
 
   const signalingRef = useRef<SignalingClient | null>(null);
   const peerManagerRef = useRef<PeerManager | null>(null);
+  const mediaControllerRef = useRef<VoiceMediaController | null>(null);
+  const screenShareControllerRef = useRef<ScreenShareController | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  const cameraStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const localPreviewRef = useRef<HTMLVideoElement | null>(null);
   const selfIdRef = useRef<string | null>(null);
@@ -132,6 +173,15 @@ function App() {
     const timestamp = new Date().toLocaleTimeString('pt-BR', { hour12: false });
     setTechnicalLogs((logs) => [...logs.slice(-399), `[${timestamp}] ${line}`]);
   }, []);
+
+  if (!mediaControllerRef.current) {
+    mediaControllerRef.current = new VoiceMediaController({
+      onVoiceActivity: setVoiceActivity,
+      onLog: (message) => appendTechnicalLog(`[VOICE] ${message}`),
+    });
+  }
+
+  if (!screenShareControllerRef.current) screenShareControllerRef.current = new ScreenShareController();
 
   if (!peerManagerRef.current) {
     peerManagerRef.current = new PeerManager({
@@ -203,18 +253,40 @@ function App() {
     if (next === 'closed' && roomIdRef.current) setStatus('Signaling encerrado');
   }, []);
 
+  const refreshMediaDevices = useCallback(async () => {
+    try {
+      const devices = await mediaControllerRef.current!.enumerateDevices();
+      setMediaDevices(devices);
+      return devices;
+    } catch (cause) {
+      appendTechnicalLog(`[MEDIA] falha enumerando dispositivos: ${cause instanceof Error ? cause.message : String(cause)}`);
+      return { audioInputs: [], audioOutputs: [], videoInputs: [] } satisfies MediaDeviceCatalog;
+    }
+  }, [appendTechnicalLog]);
+
   const ensureMicrophone = useCallback(async () => {
     if (micStreamRef.current) return micStreamRef.current;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: false,
-      });
+      const controller = mediaControllerRef.current!;
+      controller.setMuted(!micEnabled);
+      controller.setDeafened(deafened);
+      controller.setInputMode(inputMode);
+      controller.setSensitivity(sensitivityMode, manualSensitivityDb);
+      let stream: MediaStream;
+      try {
+        stream = await controller.startMicrophone(microphoneDeviceId || undefined);
+      } catch (cause) {
+        if (!microphoneDeviceId) throw cause;
+        appendTechnicalLog('[MEDIA] microfone salvo não está disponível; usando dispositivo padrão');
+        setMicrophoneDeviceId('');
+        localStorage.setItem('discordy:microphone-device', '');
+        stream = await controller.startMicrophone();
+      }
       micStreamRef.current = stream;
-      for (const track of stream.getAudioTracks()) track.enabled = micEnabled;
       peerManagerRef.current?.setMicrophone(stream);
-      peerManagerRef.current?.setMicrophoneEnabled(micEnabled);
+      peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !deafened);
       appendTechnicalLog(`[MEDIA] microphone=${stream.getAudioTracks()[0]?.id.slice(0, 8) || 'none'}`);
+      void refreshMediaDevices();
       return stream;
     } catch (cause) {
       appendTechnicalLog(`[MEDIA] microfone indisponível: ${cause instanceof Error ? cause.message : String(cause)}`);
@@ -222,7 +294,7 @@ function App() {
       peerManagerRef.current?.setMicrophone(null);
       return null;
     }
-  }, [appendTechnicalLog, micEnabled]);
+  }, [appendTechnicalLog, deafened, inputMode, manualSensitivityDb, micEnabled, microphoneDeviceId, refreshMediaDevices, sensitivityMode]);
 
   const connectToRoom = useCallback(async (targetServer: string, targetRoom: string, requestedName: string) => {
     const cleanName = requestedName.trim().slice(0, 40);
@@ -304,21 +376,30 @@ function App() {
     signalingRef.current = null;
     peerManagerRef.current?.reset();
 
-    micStreamRef.current?.getTracks().forEach((track) => track.stop());
+    await mediaControllerRef.current?.destroy();
     micStreamRef.current = null;
+    cameraStreamRef.current = null;
     screenStreamRef.current?.getTracks().forEach((track) => track.stop());
     screenStreamRef.current = null;
     selfIdRef.current = null;
     roomIdRef.current = null;
 
+    setCameraStream(null);
     setScreenStream(null);
+    setScreenMetadata(null);
+    setExpandedScreenKey(null);
+    setScreenPickerOpen(false);
     setRemotePeers([]);
+    setRemoteSpeaking({});
+    setPeerVolumes({});
     setRoomId(null);
     setSelfId(null);
     setServerUrl(null);
     setStatus('Pronto');
     setShowLogs(false);
     setShowDiagnostics(false);
+    setShowMediaSettings(false);
+    setDeafened(false);
     setNetworkDiagnostics([]);
     setDiagnosticsError(null);
     setDiagnosticsUpdatedAt(null);
@@ -332,35 +413,197 @@ function App() {
   const toggleMic = () => {
     const next = !micEnabled;
     setMicEnabled(next);
-    peerManagerRef.current?.setMicrophoneEnabled(next);
+    mediaControllerRef.current?.setMuted(!next);
+    peerManagerRef.current?.setMicrophoneEnabled(next && !deafened);
+    appendTechnicalLog(`[VOICE] mute=${!next}`);
   };
+
+  const toggleDeafen = () => {
+    const next = !deafened;
+    setDeafened(next);
+    mediaControllerRef.current?.setDeafened(next);
+    peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !next);
+    appendTechnicalLog(`[VOICE] deafen=${next}`);
+  };
+
+  const toggleCamera = useCallback(async () => {
+    const controller = mediaControllerRef.current!;
+    if (cameraStreamRef.current) {
+      controller.stopCamera();
+      cameraStreamRef.current = null;
+      peerManagerRef.current?.setCamera(null);
+      setCameraStream(null);
+      return;
+    }
+    try {
+      let stream: MediaStream;
+      try {
+        stream = await controller.startCamera(cameraDeviceId || undefined);
+      } catch (cause) {
+        if (!cameraDeviceId) throw cause;
+        appendTechnicalLog('[MEDIA] câmera salva não está disponível; usando dispositivo padrão');
+        setCameraDeviceId('');
+        localStorage.setItem('discordy:camera-device', '');
+        stream = await controller.startCamera();
+      }
+      cameraStreamRef.current = stream;
+      peerManagerRef.current?.setCamera(stream);
+      setCameraStream(stream);
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        if (cameraStreamRef.current !== stream) return;
+        cameraStreamRef.current = null;
+        peerManagerRef.current?.setCamera(null);
+        setCameraStream(null);
+      }, { once: true });
+      void refreshMediaDevices();
+    } catch (cause) {
+      appendTechnicalLog(`[MEDIA] câmera indisponível: ${cause instanceof Error ? cause.message : String(cause)}`);
+      setError('Não foi possível acessar a câmera selecionada.');
+    }
+  }, [appendTechnicalLog, cameraDeviceId, refreshMediaDevices]);
+
+  const changeMicrophone = useCallback(async (deviceId: string) => {
+    setMicrophoneDeviceId(deviceId);
+    localStorage.setItem('discordy:microphone-device', deviceId);
+    if (!roomIdRef.current) return;
+    try {
+      const stream = await mediaControllerRef.current!.switchMicrophone(deviceId || undefined);
+      micStreamRef.current = stream;
+      peerManagerRef.current?.setMicrophone(stream);
+      peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !deafened);
+      void refreshMediaDevices();
+    } catch (cause) {
+      appendTechnicalLog(`[MEDIA] falha trocando microfone: ${cause instanceof Error ? cause.message : String(cause)}`);
+      setError('Não foi possível trocar o microfone.');
+    }
+  }, [appendTechnicalLog, deafened, micEnabled, refreshMediaDevices]);
+
+  const changeCamera = useCallback(async (deviceId: string) => {
+    setCameraDeviceId(deviceId);
+    localStorage.setItem('discordy:camera-device', deviceId);
+    if (!cameraStreamRef.current) return;
+    try {
+      const stream = await mediaControllerRef.current!.switchCamera(deviceId || undefined);
+      cameraStreamRef.current = stream;
+      peerManagerRef.current?.setCamera(stream);
+      setCameraStream(stream);
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => {
+        if (cameraStreamRef.current !== stream) return;
+        cameraStreamRef.current = null;
+        peerManagerRef.current?.setCamera(null);
+        setCameraStream(null);
+      }, { once: true });
+      void refreshMediaDevices();
+    } catch (cause) {
+      appendTechnicalLog(`[MEDIA] falha trocando câmera: ${cause instanceof Error ? cause.message : String(cause)}`);
+      setError('Não foi possível trocar a câmera.');
+    }
+  }, [appendTechnicalLog, refreshMediaDevices]);
+
+  const changeOutputDevice = (deviceId: string) => {
+    setOutputDeviceId(deviceId);
+    localStorage.setItem('discordy:output-device', deviceId);
+    appendTechnicalLog(`[MEDIA] saída de áudio=${deviceId || 'default'}`);
+  };
+
+  const handleRemoteSpeaking = useCallback((peerId: string, speaking: boolean) => {
+    setRemoteSpeaking((current) => current[peerId] === speaking ? current : { ...current, [peerId]: speaking });
+  }, []);
 
   const stopScreenShare = useCallback(async () => {
     const stream = screenStreamRef.current;
     if (!stream) return;
     screenStreamRef.current = null;
-    peerManagerRef.current?.setScreen(null);
+    peerManagerRef.current?.setScreen(null, null);
     setScreenStream(null);
+    setScreenMetadata(null);
+    setExpandedScreenKey((key) => key === 'local' ? null : key);
     for (const track of stream.getTracks()) track.stop();
-    appendTechnicalLog('[MEDIA] compartilhamento local encerrado');
+    appendTechnicalLog('[SCREEN] compartilhamento local encerrado');
   }, [appendTechnicalLog]);
 
-  const startScreenShare = async () => {
+  const openScreenPicker = useCallback(async () => {
+    if (screenStreamRef.current) return;
+    setScreenPickerOpen(true);
+    setScreenSourcesLoading(true);
+    setError(null);
+    try {
+      const sources = await screenShareControllerRef.current!.listSources();
+      setScreenSources(sources);
+      appendTechnicalLog(`[SCREEN] ${sources.length} fonte(s) de captura encontrada(s)`);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError('Não foi possível listar monitores e janelas.');
+      appendTechnicalLog(`[SCREEN] falha listando fontes: ${message}`);
+    } finally {
+      setScreenSourcesLoading(false);
+    }
+  }, [appendTechnicalLog]);
+
+  const startScreenShare = useCallback(async (source: ScreenSourceInfo) => {
     if (screenStreamRef.current) return;
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: 30, max: 60 } },
-        audio: true,
+      const session = await screenShareControllerRef.current!.start(source, {
+        preset: screenQuality,
+        bitrateKbps: screenBitrateKbps,
+        systemAudio: screenSystemAudio,
       });
+      const { stream, metadata } = session;
       screenStreamRef.current = stream;
-      peerManagerRef.current?.setScreen(stream);
+      peerManagerRef.current?.setScreen(stream, metadata);
+      peerManagerRef.current?.setScreenBitrate(metadata.bitrateKbps);
       setScreenStream(stream);
+      setScreenMetadata(metadata);
+      setScreenPickerOpen(false);
       const videoTrack = stream.getVideoTracks()[0];
-      appendTechnicalLog(`[MEDIA] screen video=${videoTrack?.id.slice(0, 8) || 'none'} audio=${stream.getAudioTracks()[0]?.id.slice(0, 8) || 'none'}`);
+      const settings = videoTrack?.getSettings();
+      appendTechnicalLog(`[SCREEN] ${metadata.sourceType}/${metadata.sourceName} preset=${metadata.preset} bitrate=${metadata.bitrateKbps}Kbps audio=${metadata.systemAudio} captura=${settings?.width ?? '?'}x${settings?.height ?? '?'}@${settings?.frameRate ?? '?'}fps`);
       videoTrack?.addEventListener('ended', () => void stopScreenShare(), { once: true });
     } catch (cause) {
-      appendTechnicalLog(`[MEDIA] compartilhamento cancelado/indisponível: ${cause instanceof Error ? cause.message : String(cause)}`);
+      const message = cause instanceof Error ? cause.message : String(cause);
+      appendTechnicalLog(`[SCREEN] compartilhamento cancelado/indisponível: ${message}`);
+      if (!(cause instanceof DOMException && cause.name === 'NotAllowedError')) setError('Não foi possível iniciar o compartilhamento selecionado.');
     }
+  }, [appendTechnicalLog, screenBitrateKbps, screenQuality, screenSystemAudio, stopScreenShare]);
+
+  const updateScreenQuality = useCallback(async (preset: ScreenQualityPreset) => {
+    setScreenQuality(preset);
+    localStorage.setItem('discordy:screen-quality', preset);
+    const defaultBitrate = SCREEN_QUALITY_PRESETS[preset].defaultBitrateKbps;
+    setScreenBitrateKbps(defaultBitrate);
+    localStorage.setItem('discordy:screen-bitrate', String(defaultBitrate));
+    peerManagerRef.current?.setScreenBitrate(defaultBitrate);
+
+    const stream = screenStreamRef.current;
+    if (!stream) return;
+    await screenShareControllerRef.current!.applyQuality(stream, preset).catch((cause) => {
+      appendTechnicalLog(`[SCREEN] falha aplicando preset ${preset}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    });
+    const current = screenMetadata;
+    if (current) {
+      const quality = SCREEN_QUALITY_PRESETS[preset];
+      const metadata: ScreenShareMetadata = { ...current, preset, targetWidth: quality.width, targetHeight: quality.height, targetFps: quality.fps, bitrateKbps: defaultBitrate };
+      setScreenMetadata(metadata);
+      peerManagerRef.current?.updateScreenMetadata(metadata);
+    }
+  }, [appendTechnicalLog, screenMetadata]);
+
+  const updateScreenBitrate = useCallback((value: number) => {
+    const bitrate = Math.max(500, Math.min(20000, Math.round(value)));
+    setScreenBitrateKbps(bitrate);
+    localStorage.setItem('discordy:screen-bitrate', String(bitrate));
+    peerManagerRef.current?.setScreenBitrate(bitrate);
+    setScreenMetadata((current) => {
+      if (!current) return current;
+      const next = { ...current, bitrateKbps: bitrate };
+      peerManagerRef.current?.updateScreenMetadata(next);
+      return next;
+    });
+  }, []);
+
+  const updateScreenSystemAudio = (enabled: boolean) => {
+    setScreenSystemAudio(enabled);
+    localStorage.setItem('discordy:screen-system-audio', String(enabled));
   };
 
   const copyInvite = async () => {
@@ -461,9 +704,110 @@ function App() {
     localStorage.setItem('discordy:density', next);
   };
 
+  const updateInputMode = (next: VoiceInputMode) => {
+    setInputMode(next);
+    localStorage.setItem('discordy:input-mode', next);
+    mediaControllerRef.current?.setInputMode(next);
+  };
+
+  const updateSensitivityMode = (next: SensitivityMode) => {
+    setSensitivityMode(next);
+    localStorage.setItem('discordy:sensitivity-mode', next);
+    mediaControllerRef.current?.setSensitivity(next, manualSensitivityDb);
+  };
+
+  const updateManualSensitivity = (next: number) => {
+    setManualSensitivityDb(next);
+    localStorage.setItem('discordy:sensitivity-db', String(next));
+    mediaControllerRef.current?.setSensitivity(sensitivityMode, next);
+  };
+
+  const updatePushToMute = (enabled: boolean) => {
+    setPushToMuteEnabled(enabled);
+    localStorage.setItem('discordy:push-to-mute', String(enabled));
+    if (!enabled) {
+      setPushToMutePressed(false);
+      mediaControllerRef.current?.setPushToMutePressed(false);
+    }
+  };
+
+  const setPeerVolume = (peerId: string, volume: number) => {
+    setPeerVolumes((current) => ({ ...current, [peerId]: volume }));
+  };
+
   useEffect(() => {
-    if (localPreviewRef.current) localPreviewRef.current.srcObject = screenStream;
-  }, [screenStream]);
+    if (localPreviewRef.current) localPreviewRef.current.srcObject = cameraStream;
+  }, [cameraStream]);
+
+  useEffect(() => {
+    const controller = mediaControllerRef.current!;
+    controller.setMuted(!micEnabled);
+    controller.setDeafened(deafened);
+    controller.setInputMode(inputMode);
+    controller.setSensitivity(sensitivityMode, manualSensitivityDb);
+  }, [deafened, inputMode, manualSensitivityDb, micEnabled, sensitivityMode]);
+
+  useEffect(() => {
+    if (!navigator.mediaDevices?.addEventListener) return undefined;
+    const handleDeviceChange = () => void refreshMediaDevices();
+    navigator.mediaDevices.addEventListener('devicechange', handleDeviceChange);
+    return () => navigator.mediaDevices.removeEventListener('devicechange', handleDeviceChange);
+  }, [refreshMediaDevices]);
+
+  useEffect(() => {
+    if (!roomId) return undefined;
+    const isEditableTarget = (target: EventTarget | null) => target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target) || event.repeat) return;
+      if (event.code === 'KeyV' && inputMode === 'push-to-talk') {
+        setPushToTalkPressed(true);
+        mediaControllerRef.current?.setPushToTalkPressed(true);
+      }
+      if (event.code === 'KeyM' && pushToMuteEnabled) {
+        setPushToMutePressed(true);
+        mediaControllerRef.current?.setPushToMutePressed(true);
+        peerManagerRef.current?.setMicrophoneEnabled(false);
+      }
+    };
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'KeyV') {
+        setPushToTalkPressed(false);
+        mediaControllerRef.current?.setPushToTalkPressed(false);
+      }
+      if (event.code === 'KeyM') {
+        setPushToMutePressed(false);
+        mediaControllerRef.current?.setPushToMutePressed(false);
+        peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !deafened);
+      }
+    };
+    const releaseShortcuts = () => {
+      setPushToTalkPressed(false);
+      setPushToMutePressed(false);
+      mediaControllerRef.current?.setPushToTalkPressed(false);
+      mediaControllerRef.current?.setPushToMutePressed(false);
+      peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !deafened);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+    window.addEventListener('blur', releaseShortcuts);
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+      window.removeEventListener('blur', releaseShortcuts);
+      releaseShortcuts();
+    };
+  }, [deafened, inputMode, micEnabled, pushToMuteEnabled, roomId]);
+
+  useEffect(() => {
+    if (!expandedScreenKey) return;
+    if (expandedScreenKey === 'local') {
+      if (!screenStream) setExpandedScreenKey(null);
+      return;
+    }
+    const peerId = expandedScreenKey.startsWith('peer:') ? expandedScreenKey.slice(5) : '';
+    const active = remotePeers.some((peer) => peer.peerId === peerId && peer.media.screen);
+    if (!active) setExpandedScreenKey(null);
+  }, [expandedScreenKey, remotePeers, screenStream]);
 
   useEffect(() => {
     if (!showDiagnostics || !roomId || networkTesting) return undefined;
@@ -493,7 +837,7 @@ function App() {
   useEffect(() => () => {
     signalingRef.current?.close();
     peerManagerRef.current?.reset();
-    micStreamRef.current?.getTracks().forEach((track) => track.stop());
+    void mediaControllerRef.current?.destroy();
     screenStreamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
 
@@ -501,6 +845,11 @@ function App() {
 
   if (roomId) {
     const totalParticipants = remotePeers.length + 1;
+    const inputLevelPercent = Math.max(0, Math.min(100, ((voiceActivity.levelDb + 80) / 60) * 100));
+    const thresholdPercent = Math.max(0, Math.min(100, ((voiceActivity.thresholdDb + 80) / 60) * 100));
+    const remoteScreenPeers = remotePeers.filter((peer) => peer.media.screen && peer.stream.getVideoTracks().some((track) => track.readyState === 'live' && (!peer.mediaTrackIds.screen || track.id === peer.mediaTrackIds.screen)));
+    const screenShareCount = remoteScreenPeers.length + (screenStream ? 1 : 0);
+    const hasScreenShares = screenShareCount > 0;
 
     return (
       <main className={rootClassName}>
@@ -531,15 +880,16 @@ function App() {
                   <span>Geral</span>
                 </button>
                 <div className="voice-users">
-                  <div className="voice-user">
+                  <div className={`voice-user ${voiceActivity.speaking ? 'is-speaking' : ''}`}>
                     <span className="avatar avatar--xs">{initialFor(name)}</span>
                     <span className="voice-user__name">{name || 'Você'}</span>
-                    {!micEnabled && <Icon name="micOff" size={13} />}
+                    {(!micEnabled || deafened) && <Icon name="micOff" size={13} />}
                   </div>
                   {remotePeers.map((peer) => (
-                    <div className="voice-user" key={peer.peerId}>
+                    <div className={`voice-user ${remoteSpeaking[peer.peerId] ? 'is-speaking' : ''}`} key={peer.peerId}>
                       <span className="avatar avatar--xs avatar--remote">{initialFor(peer.name)}</span>
                       <span className="voice-user__name">{peer.name}</span>
+                      {!peer.media.microphone && <Icon name="micOff" size={13} />}
                     </div>
                   ))}
                 </div>
@@ -559,13 +909,13 @@ function App() {
                 <div className="voice-status-row">
                   <div><span className="connection-dot" /><strong>Voz conectada</strong><small>WebRTC P2P · {status}</small></div>
                   <div className="voice-status-tools">
-                    <button className={`icon-button icon-button--small ${showDiagnostics ? 'is-active' : ''}`} title="Diagnóstico de rede" onClick={() => { setShowDiagnostics((value) => !value); setShowLogs(false); }}><Icon name="activity" size={16} /></button>
-                    <button className={`icon-button icon-button--small ${showLogs ? 'is-active' : ''}`} title="Logs técnicos" onClick={() => { setShowLogs((value) => !value); setShowDiagnostics(false); }}><Icon name="logs" size={16} /></button>
+                    <button className={`icon-button icon-button--small ${showDiagnostics ? 'is-active' : ''}`} title="Diagnóstico de rede" onClick={() => { setShowDiagnostics((value) => !value); setShowLogs(false); setShowMediaSettings(false); }}><Icon name="activity" size={16} /></button>
+                    <button className={`icon-button icon-button--small ${showLogs ? 'is-active' : ''}`} title="Logs técnicos" onClick={() => { setShowLogs((value) => !value); setShowDiagnostics(false); setShowMediaSettings(false); }}><Icon name="logs" size={16} /></button>
                   </div>
                 </div>
                 <div className="voice-status-actions">
-                  <button className="mini-action" onClick={() => void (screenStream ? stopScreenShare() : startScreenShare())}><Icon name="screen" size={15} />{screenStream ? 'Parar tela' : 'Tela'}</button>
-                  <button className="mini-action" disabled title="Câmera será adicionada em Voice & Media"><Icon name="video" size={15} />Vídeo</button>
+                  <button className="mini-action" onClick={() => void (screenStream ? stopScreenShare() : openScreenPicker())}><Icon name="screen" size={15} />{screenStream ? 'Parar tela' : 'Tela'}</button>
+                  <button className={`mini-action ${cameraStream ? 'is-active' : ''}`} onClick={() => void toggleCamera()}><Icon name="video" size={15} />{cameraStream ? 'Parar vídeo' : 'Vídeo'}</button>
                 </div>
               </section>
 
@@ -573,8 +923,8 @@ function App() {
                 <span className="avatar avatar--sm">{initialFor(name)}</span>
                 <div className="current-user-copy"><strong>{name || 'Você'}</strong><span>{selfId ? `#${selfId.slice(0, 4)}` : 'local'}</span></div>
                 <button className={`icon-button icon-button--small ${!micEnabled ? 'is-danger' : ''}`} title={micEnabled ? 'Silenciar microfone' : 'Ativar microfone'} onClick={toggleMic}><Icon name={micEnabled ? 'mic' : 'micOff'} size={17} /></button>
-                <button className="icon-button icon-button--small" title="Desativar áudio de saída (em breve)" disabled><Icon name="headphones" size={17} /></button>
-                <button className="icon-button icon-button--small" title="Configurações (em breve)" disabled><Icon name="settings" size={17} /></button>
+                <button className={`icon-button icon-button--small ${deafened ? 'is-danger' : ''}`} title={deafened ? 'Ativar áudio' : 'Deafen'} onClick={toggleDeafen}><Icon name="headphones" size={17} /></button>
+                <button className={`icon-button icon-button--small ${showMediaSettings ? 'is-active' : ''}`} title="Voz e vídeo" onClick={() => { setShowMediaSettings((value) => !value); setShowDiagnostics(false); setShowLogs(false); void refreshMediaDevices(); }}><Icon name="settings" size={17} /></button>
               </section>
             </div>
           </aside>
@@ -595,6 +945,135 @@ function App() {
 
             <div className="stage-content">
               {error && <div className="alert alert--stage">{error}</div>}
+
+              {screenPickerOpen && (
+                <section className="screen-picker-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setScreenPickerOpen(false); }}>
+                  <div className="screen-picker" role="dialog" aria-modal="true" aria-label="Compartilhar tela">
+                    <header className="screen-picker__header">
+                      <div><strong>Compartilhar sua tela</strong><span>Escolha um monitor ou uma janela.</span></div>
+                      <button className="text-button" onClick={() => setScreenPickerOpen(false)}>Cancelar</button>
+                    </header>
+                    <div className="screen-picker__settings">
+                      <label>Qualidade
+                        <select value={screenQuality} onChange={(event) => void updateScreenQuality(event.target.value as ScreenQualityPreset)}>
+                          {Object.entries(SCREEN_QUALITY_PRESETS).map(([key, preset]) => <option key={key} value={key}>{preset.label}</option>)}
+                        </select>
+                      </label>
+                      <label>Bitrate
+                        <select value={screenBitrateKbps} onChange={(event) => updateScreenBitrate(Number(event.target.value))}>
+                          {[1500, 2500, 4500, 6000, 8000, 12000, 16000, 20000].map((value) => <option key={value} value={value}>{value >= 1000 ? `${(value / 1000).toFixed(value % 1000 === 0 ? 0 : 1)} Mbps` : `${value} Kbps`}</option>)}
+                        </select>
+                      </label>
+                      <label className="screen-audio-toggle"><input type="checkbox" checked={screenSystemAudio} onChange={(event) => updateScreenSystemAudio(event.target.checked)} /><span>Compartilhar áudio do sistema</span></label>
+                    </div>
+                    <div className="screen-picker__body">
+                      {screenSourcesLoading && <div className="screen-picker__empty">Buscando monitores e janelas...</div>}
+                      {!screenSourcesLoading && screenSources.length === 0 && <div className="screen-picker__empty">Nenhuma fonte de captura disponível.</div>}
+                      {screenSources.map((source) => (
+                        <button className="screen-source-card" key={source.id} onClick={() => void startScreenShare(source)}>
+                          <span className="screen-source-card__preview">{source.thumbnail ? <img src={source.thumbnail} alt="" /> : <span>Sem prévia</span>}</span>
+                          <span className="screen-source-card__copy"><strong>{source.name}</strong><small>{source.type === 'monitor' ? 'Monitor' : 'Janela'}</small></span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {showMediaSettings && (
+                <section className="media-settings-drawer">
+                  <div className="media-settings__header">
+                    <div><strong>Voz, vídeo e tela</strong><span>Dispositivos, sensibilidade e compartilhamento</span></div>
+                    <button className="text-button" onClick={() => setShowMediaSettings(false)}>Fechar</button>
+                  </div>
+                  <div className="media-settings__body">
+                    <div className="settings-group">
+                      <strong>Dispositivos</strong>
+                      <label>Microfone
+                        <select value={microphoneDeviceId} onChange={(event) => void changeMicrophone(event.target.value)}>
+                          <option value="">Padrão do sistema</option>
+                          {mediaDevices.audioInputs.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Microfone ${index + 1}`}</option>)}
+                        </select>
+                      </label>
+                      <label>Saída de áudio
+                        <select value={outputDeviceId} onChange={(event) => changeOutputDevice(event.target.value)}>
+                          <option value="">Padrão do sistema</option>
+                          {mediaDevices.audioOutputs.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Saída ${index + 1}`}</option>)}
+                        </select>
+                      </label>
+                      <label>Câmera
+                        <select value={cameraDeviceId} onChange={(event) => void changeCamera(event.target.value)}>
+                          <option value="">Padrão do sistema</option>
+                          {mediaDevices.videoInputs.map((device, index) => <option key={device.deviceId} value={device.deviceId}>{device.label || `Câmera ${index + 1}`}</option>)}
+                        </select>
+                      </label>
+                    </div>
+
+                    <div className="settings-group">
+                      <strong>Modo de entrada</strong>
+                      <div className="segmented-control segmented-control--wide">
+                        <button className={inputMode === 'voice-activity' ? 'is-active' : ''} onClick={() => updateInputMode('voice-activity')}>Atividade de voz</button>
+                        <button className={inputMode === 'push-to-talk' ? 'is-active' : ''} onClick={() => updateInputMode('push-to-talk')}>Push-to-Talk</button>
+                      </div>
+                      {inputMode === 'push-to-talk' && <div className={`shortcut-state ${pushToTalkPressed ? 'is-active' : ''}`}><kbd>V</kbd><span>Segure V para transmitir</span></div>}
+                    </div>
+
+                    <div className="settings-group">
+                      <div className="settings-row settings-row--between"><strong>Sensibilidade</strong><span>{Math.round(voiceActivity.thresholdDb)} dB</span></div>
+                      <div className="segmented-control segmented-control--wide">
+                        <button className={sensitivityMode === 'automatic' ? 'is-active' : ''} onClick={() => updateSensitivityMode('automatic')}>Automática</button>
+                        <button className={sensitivityMode === 'manual' ? 'is-active' : ''} onClick={() => updateSensitivityMode('manual')}>Manual</button>
+                      </div>
+                      <div className="voice-meter">
+                        <span className="voice-meter__level" style={{ width: `${inputLevelPercent}%` }} />
+                        <span className="voice-meter__threshold" style={{ left: `${thresholdPercent}%` }} />
+                      </div>
+                      {sensitivityMode === 'manual' && (
+                        <input className="sensitivity-range" type="range" min="-80" max="-20" step="1" value={manualSensitivityDb} onChange={(event) => updateManualSensitivity(Number(event.target.value))} />
+                      )}
+                      <small>{voiceActivity.transmitting ? 'Transmitindo voz' : voiceActivity.speaking ? 'Voz detectada' : 'Aguardando voz'}</small>
+                    </div>
+
+                    <div className="settings-group">
+                      <div className="settings-row settings-row--between">
+                        <div><strong>Push-to-Mute</strong><small>Segure M para cortar o microfone.</small></div>
+                        <label className="switch-control"><input type="checkbox" checked={pushToMuteEnabled} onChange={(event) => updatePushToMute(event.target.checked)} /><span /></label>
+                      </div>
+                      {pushToMuteEnabled && <div className={`shortcut-state ${pushToMutePressed ? 'is-danger' : ''}`}><kbd>M</kbd><span>{pushToMutePressed ? 'Microfone temporariamente fechado' : 'Segure M para silenciar'}</span></div>}
+                    </div>
+
+                    <div className="settings-group">
+                      <div className="settings-row settings-row--between"><strong>Compartilhamento de tela</strong><span>{screenStream ? 'Transmitindo' : 'Pronto'}</span></div>
+                      <label>Qualidade
+                        <select value={screenQuality} onChange={(event) => void updateScreenQuality(event.target.value as ScreenQualityPreset)}>
+                          {Object.entries(SCREEN_QUALITY_PRESETS).map(([key, preset]) => <option key={key} value={key}>{preset.label}</option>)}
+                        </select>
+                      </label>
+                      <label>Bitrate máximo <span className="inline-value">{screenBitrateKbps >= 1000 ? `${(screenBitrateKbps / 1000).toFixed(1)} Mbps` : `${screenBitrateKbps} Kbps`}</span>
+                        <input type="range" min="500" max="20000" step="250" value={screenBitrateKbps} onChange={(event) => updateScreenBitrate(Number(event.target.value))} />
+                      </label>
+                      <div className="settings-row settings-row--between">
+                        <div><strong>Áudio do sistema</strong><small>Opcional. No Windows usa captura loopback.</small></div>
+                        <label className="switch-control"><input type="checkbox" checked={screenSystemAudio} disabled={Boolean(screenStream)} onChange={(event) => updateScreenSystemAudio(event.target.checked)} /><span /></label>
+                      </div>
+                      {screenStream && <small>Para alterar a origem ou o áudio do sistema, pare a transmissão atual e compartilhe novamente.</small>}
+                    </div>
+
+                    {remotePeers.length > 0 && (
+                      <div className="settings-group">
+                        <strong>Volumes individuais</strong>
+                        {remotePeers.map((peer) => (
+                          <label className="settings-peer-volume" key={peer.peerId}>
+                            <span>{peer.name}</span>
+                            <input type="range" min="0" max="100" step="5" value={peerVolumes[peer.peerId] ?? 100} onChange={(event) => setPeerVolume(peer.peerId, Number(event.target.value))} />
+                            <small>{peerVolumes[peer.peerId] ?? 100}%</small>
+                          </label>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </section>
+              )}
 
               {showDiagnostics && (
                 <section className="network-drawer">
@@ -646,22 +1125,53 @@ function App() {
                 </section>
               )}
 
-              <section className={`media-grid media-grid--${Math.min(totalParticipants, 4)}`}>
-                <article className={`media-tile media-tile--self ${screenStream ? 'has-video' : ''}`}>
+              {hasScreenShares && (
+                <section className={`screen-share-stage ${expandedScreenKey ? 'screen-share-stage--focused' : ''}`}>
+                  <header className="screen-share-stage__header">
+                    <div><span className="live-dot" /><strong>{screenShareCount === 1 ? '1 transmissão ativa' : `${screenShareCount} transmissões ativas`}</strong></div>
+                    {expandedScreenKey && <button className="text-button" onClick={() => setExpandedScreenKey(null)}>Mostrar todas</button>}
+                  </header>
+                  <div className={`screen-share-grid screen-share-grid--${Math.min(screenShareCount, 4)}`}>
+                    {screenStream && (!expandedScreenKey || expandedScreenKey === 'local') && (
+                      <ScreenShareTile
+                        stream={screenStream}
+                        trackId={screenStream.getVideoTracks()[0]?.id}
+                        broadcasterName={name || 'Você'}
+                        metadata={screenMetadata}
+                        local
+                        expanded={expandedScreenKey === 'local'}
+                        onToggleExpand={() => setExpandedScreenKey((current) => current === 'local' ? null : 'local')}
+                      />
+                    )}
+                    {remoteScreenPeers.map((peer) => {
+                      const key = `peer:${peer.peerId}`;
+                      if (expandedScreenKey && expandedScreenKey !== key) return null;
+                      return <ScreenShareTile key={key} stream={peer.stream} trackId={peer.mediaTrackIds.screen} broadcasterName={peer.name} metadata={peer.screenShare} expanded={expandedScreenKey === key} onToggleExpand={() => setExpandedScreenKey((current) => current === key ? null : key)} />;
+                    })}
+                  </div>
+                </section>
+              )}
+
+              <section className={`media-grid media-grid--${Math.min(totalParticipants, 4)} ${hasScreenShares ? 'media-grid--with-screen' : ''}`}>
+                <article className={`media-tile media-tile--self ${cameraStream ? 'has-video' : ''} ${voiceActivity.speaking ? 'is-speaking' : ''}`}>
                   <div className="media-tile__viewport">
                     <video ref={localPreviewRef} autoPlay muted playsInline />
-                    {!screenStream && (
+                    {!cameraStream && (
                       <div className="media-fallback">
                         <span className="avatar avatar--xl">{initialFor(name)}</span>
                       </div>
                     )}
                     <div className="media-tile__status">
-                      <span>{name || 'Você'} <small>Você</small></span>
-                      {!micEnabled && <span className="media-state-icon"><Icon name="micOff" size={14} /></span>}
+                      <span>{name || 'Você'} <small>{cameraStream ? 'Você · câmera' : screenStream ? 'Você · transmitindo tela' : 'Você'}</small></span>
+                      <span className="media-tile__indicators">
+                        {voiceActivity.speaking && <span className="speaking-badge">Falando</span>}
+                        {screenStream && <span className="streaming-badge">AO VIVO</span>}
+                        {(!micEnabled || deafened) && <span className="media-state-icon"><Icon name="micOff" size={14} /></span>}
+                      </span>
                     </div>
                   </div>
                 </article>
-                {remotePeers.map((peer) => <RemoteVideo key={peer.peerId} peer={peer} />)}
+                {remotePeers.map((peer) => <RemoteVideo key={peer.peerId} peer={peer} volume={peerVolumes[peer.peerId] ?? 100} deafened={deafened} outputDeviceId={outputDeviceId} onSpeakingChange={handleRemoteSpeaking} />)}
               </section>
 
               {remotePeers.length === 0 && (
@@ -673,10 +1183,10 @@ function App() {
               )}
 
               <div className="media-dock" aria-label="Controles da chamada">
-                <button className={`dock-button ${!micEnabled ? 'dock-button--danger' : ''}`} onClick={toggleMic} title={micEnabled ? 'Silenciar' : 'Ativar microfone'}><Icon name={micEnabled ? 'mic' : 'micOff'} size={20} /></button>
-                <button className="dock-button" disabled title="Desativar áudio de saída será implementado em Voice & Media"><Icon name="headphones" size={20} /></button>
-                <button className={`dock-button ${screenStream ? 'dock-button--active' : ''}`} onClick={() => void (screenStream ? stopScreenShare() : startScreenShare())} title={screenStream ? 'Parar compartilhamento' : 'Compartilhar tela'}><Icon name="screen" size={20} /></button>
-                <button className="dock-button" disabled title="Câmera será implementada em Voice & Media"><Icon name="video" size={20} /></button>
+                <button className={`dock-button ${!micEnabled ? 'dock-button--danger' : ''} ${voiceActivity.transmitting ? 'is-transmitting' : ''}`} onClick={toggleMic} title={micEnabled ? 'Silenciar' : 'Ativar microfone'}><Icon name={micEnabled ? 'mic' : 'micOff'} size={20} /></button>
+                <button className={`dock-button ${deafened ? 'dock-button--danger' : ''}`} onClick={toggleDeafen} title={deafened ? 'Ativar áudio' : 'Deafen'}><Icon name="headphones" size={20} /></button>
+                <button className={`dock-button ${screenStream ? 'dock-button--active' : ''}`} onClick={() => void (screenStream ? stopScreenShare() : openScreenPicker())} title={screenStream ? 'Parar compartilhamento' : 'Compartilhar tela'}><Icon name="screen" size={20} /></button>
+                <button className={`dock-button ${cameraStream ? 'dock-button--active' : ''}`} onClick={() => void toggleCamera()} title={cameraStream ? 'Desligar câmera' : 'Ligar câmera'}><Icon name="video" size={20} /></button>
                 <button className="dock-button dock-button--hangup" onClick={() => void leave()} title="Desconectar"><Icon name="phone" size={21} /></button>
               </div>
             </div>
@@ -692,10 +1202,14 @@ function App() {
                 <span className="presence-dot" />
               </div>
               {remotePeers.map((peer) => (
-                <div className="member-row" key={peer.peerId}>
-                  <span className="avatar avatar--sm avatar--remote">{initialFor(peer.name)}</span>
-                  <div><strong>{peer.name}</strong><span>{peer.connectionState === 'connected' ? 'Conectado' : peer.connectionState}</span></div>
-                  <span className={`presence-dot ${peer.connectionState !== 'connected' ? 'presence-dot--idle' : ''}`} />
+                <div className={`member-entry ${remoteSpeaking[peer.peerId] ? 'is-speaking' : ''}`} key={peer.peerId}>
+                  <div className="member-row">
+                    <span className="avatar avatar--sm avatar--remote">{initialFor(peer.name)}</span>
+                    <div><strong>{peer.name}</strong><span>{peer.media.screen ? 'Transmitindo tela' : remoteSpeaking[peer.peerId] ? 'Falando' : peer.connectionState === 'connected' ? 'Conectado' : peer.connectionState}</span></div>
+                    {!peer.media.microphone && <Icon name="micOff" size={13} />}
+                    <span className={`presence-dot ${peer.connectionState !== 'connected' ? 'presence-dot--idle' : ''}`} />
+                  </div>
+                  <label className="member-volume"><Icon name="volume" size={13} /><input type="range" min="0" max="100" step="5" value={peerVolumes[peer.peerId] ?? 100} onChange={(event) => setPeerVolume(peer.peerId, Number(event.target.value))} /><span>{peerVolumes[peer.peerId] ?? 100}%</span></label>
                 </div>
               ))}
             </div>
@@ -742,7 +1256,7 @@ function App() {
             <section className="welcome-card">
               <div className="welcome-card__intro">
                 <div className="welcome-logo">D</div>
-                <p className="eyebrow">Discordy Desktop 0.2.3</p>
+                <p className="eyebrow">Discordy Desktop 0.4.0</p>
                 <h1>Sua sala privada, direto entre os participantes.</h1>
                 <p>WebRTC P2P para voz e compartilhamento de tela, com signaling hospedado pelo próprio host.</p>
               </div>

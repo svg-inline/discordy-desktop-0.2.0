@@ -1,4 +1,4 @@
-import type { MediaSource, PeerInfo, RemotePeer, SignalPayload } from '../lib/types';
+import type { MediaSource, PeerInfo, RemotePeer, ScreenShareMetadata, SignalPayload } from '../lib/types';
 import { collectPeerDiagnostics } from './diagnostics';
 import type { PeerDiagnostics } from './diagnostics';
 
@@ -23,6 +23,8 @@ type PeerState = {
   disconnectedTimer: number | null;
   recoveryTimer: number | null;
   media: Record<MediaSource, boolean>;
+  mediaTrackIds: Partial<Record<MediaSource, string>>;
+  screenShare: ScreenShareMetadata | null;
 };
 
 type PeerManagerOptions = {
@@ -47,6 +49,8 @@ export class PeerManager {
   private cameraStream: MediaStream | null = null;
   private screenStream: MediaStream | null = null;
   private microphoneEnabled = true;
+  private screenShareMetadata: ScreenShareMetadata | null = null;
+  private screenBitrateKbps = 4500;
 
   constructor(options: PeerManagerOptions) {
     this.iceServers = options.iceServers;
@@ -62,27 +66,45 @@ export class PeerManager {
   setMicrophone(stream: MediaStream | null) {
     this.microphoneStream = stream;
     for (const state of this.peers.values()) this.syncLocalMedia(state);
-    this.broadcastMediaState('microphone', Boolean(stream) && this.microphoneEnabled);
+    this.broadcastMediaState('microphone', Boolean(stream) && this.microphoneEnabled, stream?.getAudioTracks()[0]?.id ?? null);
   }
 
   setMicrophoneEnabled(enabled: boolean) {
     this.microphoneEnabled = enabled;
-    for (const track of this.microphoneStream?.getAudioTracks() ?? []) track.enabled = enabled;
-    this.broadcastMediaState('microphone', Boolean(this.microphoneStream) && enabled);
+    this.broadcastMediaState('microphone', Boolean(this.microphoneStream) && enabled, this.microphoneStream?.getAudioTracks()[0]?.id ?? null);
     this.logAll(`microfone ${enabled ? 'ativado' : 'silenciado'}`);
   }
 
   setCamera(stream: MediaStream | null) {
     this.cameraStream = stream;
     for (const state of this.peers.values()) this.syncLocalMedia(state);
-    this.broadcastMediaState('camera', Boolean(stream));
+    this.broadcastMediaState('camera', Boolean(stream), stream?.getVideoTracks()[0]?.id ?? null);
   }
 
-  setScreen(stream: MediaStream | null) {
+  setScreen(stream: MediaStream | null, metadata: ScreenShareMetadata | null = null) {
     this.screenStream = stream;
+    this.screenShareMetadata = stream ? metadata : null;
+    if (metadata) this.screenBitrateKbps = metadata.bitrateKbps;
     for (const state of this.peers.values()) this.syncLocalMedia(state);
-    this.broadcastMediaState('screen', Boolean(stream));
+    this.broadcastMediaState('screen', Boolean(stream), stream?.getVideoTracks()[0]?.id ?? null, this.screenShareMetadata);
     this.logAll(`compartilhamento de tela ${stream ? 'iniciado' : 'encerrado'}`);
+  }
+
+  setScreenBitrate(bitrateKbps: number) {
+    this.screenBitrateKbps = Math.max(500, Math.min(20000, Math.round(bitrateKbps)));
+    if (this.screenShareMetadata) this.screenShareMetadata = { ...this.screenShareMetadata, bitrateKbps: this.screenBitrateKbps };
+    for (const state of this.peers.values()) {
+      const sender = state.senders.screenVideo;
+      if (sender) void this.applyScreenSenderParameters(state, sender);
+    }
+    if (this.screenStream) this.broadcastMediaState('screen', true, this.screenStream.getVideoTracks()[0]?.id ?? null, this.screenShareMetadata);
+    this.logAll(`bitrate máximo da tela=${this.screenBitrateKbps} Kbps`);
+  }
+
+  updateScreenMetadata(metadata: ScreenShareMetadata) {
+    this.screenShareMetadata = metadata;
+    this.screenBitrateKbps = metadata.bitrateKbps;
+    if (this.screenStream) this.broadcastMediaState('screen', true, this.screenStream.getVideoTracks()[0]?.id ?? null, metadata);
   }
 
   createPeer(info: PeerInfo): void {
@@ -109,6 +131,8 @@ export class PeerManager {
       disconnectedTimer: null,
       recoveryTimer: null,
       media: { microphone: true, camera: false, screen: false },
+      mediaTrackIds: {},
+      screenShare: null,
     };
 
     this.peers.set(info.peerId, state);
@@ -148,6 +172,8 @@ export class PeerManager {
     this.cameraStream = null;
     this.screenStream = null;
     this.microphoneEnabled = true;
+    this.screenShareMetadata = null;
+    this.screenBitrateKbps = 4500;
   }
 
   async getDiagnostics(): Promise<PeerDiagnostics[]> {
@@ -181,6 +207,9 @@ export class PeerManager {
 
     if ('media' in data) {
       state.media[data.media.source] = data.media.active;
+      if (data.media.trackId) state.mediaTrackIds[data.media.source] = data.media.trackId;
+      else if (!data.media.active) delete state.mediaTrackIds[data.media.source];
+      if (data.media.source === 'screen') state.screenShare = data.media.active ? (data.media.screen ?? state.screenShare) : null;
       this.log(from, `estado remoto ${data.media.source}: ${data.media.active ? 'ativo' : 'inativo'}`);
       this.emitPeers();
       return;
@@ -360,17 +389,18 @@ export class PeerManager {
     }
 
     state.senders[slot] = state.pc.addTrack(track, stream);
+    if (slot === 'screenVideo') void this.applyScreenSenderParameters(state, state.senders[slot]!);
     this.log(state.info.peerId, `${slot} adicionado (${track.kind}/${track.id.slice(0, 8)})`);
   }
 
-  private broadcastMediaState(source: MediaSource, active: boolean) {
-    for (const peerId of this.peers.keys()) this.sendSignal(peerId, { media: { source, active } });
+  private broadcastMediaState(source: MediaSource, active: boolean, trackId: string | null = null, screen: ScreenShareMetadata | null = null) {
+    for (const peerId of this.peers.keys()) this.sendSignal(peerId, { media: { source, active, trackId, ...(source === 'screen' ? { screen } : {}) } });
   }
 
   private sendCurrentMediaState(peerId: string) {
-    this.sendSignal(peerId, { media: { source: 'microphone', active: Boolean(this.microphoneStream) && this.microphoneEnabled } });
-    this.sendSignal(peerId, { media: { source: 'camera', active: Boolean(this.cameraStream) } });
-    this.sendSignal(peerId, { media: { source: 'screen', active: Boolean(this.screenStream) } });
+    this.sendSignal(peerId, { media: { source: 'microphone', active: Boolean(this.microphoneStream) && this.microphoneEnabled, trackId: this.microphoneStream?.getAudioTracks()[0]?.id ?? null } });
+    this.sendSignal(peerId, { media: { source: 'camera', active: Boolean(this.cameraStream), trackId: this.cameraStream?.getVideoTracks()[0]?.id ?? null } });
+    this.sendSignal(peerId, { media: { source: 'screen', active: Boolean(this.screenStream), trackId: this.screenStream?.getVideoTracks()[0]?.id ?? null, screen: this.screenShareMetadata } });
   }
 
   private scheduleDisconnectedRestart(state: PeerState) {
@@ -421,7 +451,24 @@ export class PeerManager {
       stream: state.remoteStream,
       connectionState: state.pc.connectionState,
       media: { ...state.media },
+      mediaTrackIds: { ...state.mediaTrackIds },
+      screenShare: state.screenShare ? { ...state.screenShare } : null,
     })));
+  }
+
+  private async applyScreenSenderParameters(state: PeerState, sender: RTCRtpSender) {
+    try {
+      const parameters = sender.getParameters();
+      parameters.encodings ??= [{}];
+      if (parameters.encodings.length === 0) parameters.encodings.push({});
+      parameters.encodings[0].maxBitrate = this.screenBitrateKbps * 1000;
+      if (this.screenShareMetadata?.targetFps) parameters.encodings[0].maxFramerate = this.screenShareMetadata.targetFps;
+      parameters.degradationPreference = 'maintain-resolution';
+      await sender.setParameters(parameters);
+      this.log(state.info.peerId, `screenVideo encoding: maxBitrate=${this.screenBitrateKbps}Kbps maxFps=${this.screenShareMetadata?.targetFps ?? 'n/d'}`);
+    } catch (cause) {
+      this.log(state.info.peerId, `falha ajustando bitrate da tela: ${this.errorMessage(cause)}`);
+    }
   }
 
   private log(peerId: string, message: string) {

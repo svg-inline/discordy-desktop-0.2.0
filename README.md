@@ -1,78 +1,146 @@
-# Discordy Desktop 0.2.2 — WebRTC Stabilization
+# Discordy Desktop 0.4.0 — Screen Share avançado
 
-Versão de estabilização da base WebRTC P2P sobre a UI Foundation 0.2.1.
+Evolução da `0.3.0` mantendo Voice & Media, Network Diagnostics e WebRTC Stabilization, com uma camada própria para compartilhamento de tela.
 
-## WebRTC Stabilization 0.2.2
+## 0.4.0 — Screen Share avançado
 
 Implementado:
 
-- compartilhamento de tela remoto renegociado corretamente;
-- tracks separadas para `microphone`, `camera`, `screenVideo` e `screenAudio`;
-- `Perfect Negotiation` para tratar colisões de ofertas;
-- negociação automática por `negotiationneeded`;
-- fila de ICE candidates enquanto a descrição remota ainda não existe;
-- `restartIce()` automático em `failed`;
-- `restartIce()` após `disconnected` persistente;
-- reconexão automática do WebSocket com backoff;
-- reentrada automática na sala depois da reconexão do signaling;
-- reconstrução das conexões WebRTC quando o signaling recebe uma nova sessão/peer ID;
-- tratamento de `connected`, `disconnected`, `failed` e `closed`;
-- heartbeat WebSocket no signaling server;
-- estado de mídia sinalizado separadamente para microfone, câmera e tela;
-- logs RTC/ICE/SDP/WebSocket disponíveis também para convidados;
-- `RTCPeerConnection` isolado da UI em `src/rtc/PeerManager.ts`.
+- seletor interno de **monitor ou janela** usando `desktopCapturer`;
+- preview das fontes antes de compartilhar;
+- áudio do sistema opcional;
+- presets:
+  - `720p30`;
+  - `1080p30`;
+  - `1080p60`;
+- controle de bitrate entre `500 Kbps` e `20 Mbps`;
+- aplicação do bitrate no `RTCRtpSender` via `setParameters()`;
+- `degradationPreference = maintain-resolution` para a track de tela;
+- FPS real medido no vídeo renderizado com `requestVideoFrameCallback()`;
+- resolução efetiva exibida sobre a transmissão;
+- fullscreen por transmissão;
+- Picture-in-Picture por transmissão;
+- expandir/reduzir uma transmissão dentro da sala;
+- identificação clara de quem está transmitindo;
+- tipo e nome da fonte compartilhada;
+- estado `AO VIVO`;
+- câmera e tela renderizadas separadamente;
+- múltiplos participantes podem compartilhar simultaneamente;
+- cada participante continua limitado a uma transmissão de tela ativa por vez nesta versão;
+- metadados de tela propagados pelo signaling (`preset`, fonte, bitrate, FPS alvo e áudio do sistema).
 
-## Fluxo da mídia
-
-```text
-microphone  ─┐
-camera      ─┼─> PeerManager ─> RTCPeerConnection
-screenVideo ─┤
-screenAudio ─┘
-```
-
-A câmera já possui slot independente na camada RTC, mas a captura/UI de câmera continua reservada para a etapa **Voice & Media**.
-
-## Recuperação automática
-
-### WebSocket
+## Arquitetura
 
 ```text
-WebSocket perdido
-  -> reconnect 1s
-  -> reconnect 2s
-  -> reconnect 4s
-  -> reconnect 8s
-  -> máximo 10s entre tentativas
-  -> join automático na sala
-  -> recebe novo welcome
-  -> reconstrói peers WebRTC
+Participante
+├── microphone
+├── camera
+└── screen
+    ├── screenVideo
+    ├── screenAudio opcional
+    └── ScreenShareMetadata
+
+PeerManager
+├── Perfect Negotiation
+├── RTCRtpSender screenVideo
+│   ├── maxBitrate
+│   ├── maxFramerate
+│   └── maintain-resolution
+└── signaling de estado da transmissão
 ```
 
-### WebRTC
+A câmera não é mais substituída visualmente pela tela. O layout trata as transmissões como superfícies independentes:
 
 ```text
-connected
-   ↓
-disconnected
-   ↓ 3.5s sem recuperar
-restartIce()
+Screen Share Stage
+├── Tela do Victor
+├── Tela do João
+└── Tela do Pedro
 
-failed
-   ↓
-restartIce() imediato
-   ↓
-negotiationneeded
-   ↓
-Perfect Negotiation
+Participant Grid
+├── Victor / câmera / voz
+├── João / câmera / voz
+└── Pedro / câmera / voz
 ```
 
-## Requisitos para desenvolvimento
+## Seleção de monitor/janela
 
-- Node.js >= 22.12
-- npm
-- Windows recomendado para o primeiro teste
-- `cloudflared` instalado somente na máquina que hospeda a sala
+No Electron, o renderer solicita a lista de fontes ao processo principal. Ao clicar em uma fonte, o preload registra sincronamente a origem selecionada e `getDisplayMedia()` inicia a captura na mesma ação do usuário.
+
+```text
+Renderer
+   │ listSources
+   ▼
+desktopCapturer
+   │
+   ├── Monitor 1
+   ├── Monitor 2
+   ├── Chrome
+   └── VS Code
+
+Usuário escolhe
+   │
+   ▼
+setDisplayMediaRequestHandler
+   │
+   ▼
+MediaStream
+```
+
+## Áudio do sistema
+
+No Windows, quando habilitado, o processo principal concede `audio: loopback`. O stream somente anuncia áudio do sistema se uma track de áudio realmente tiver sido criada.
+
+## Qualidade e bitrate
+
+Presets padrão:
+
+```text
+720p30  → 1280×720  / 30 FPS / 2.5 Mbps inicial
+1080p30 → 1920×1080 / 30 FPS / 4.5 Mbps inicial
+1080p60 → 1920×1080 / 60 FPS / 8.0 Mbps inicial
+```
+
+O bitrate continua ajustável manualmente até `20 Mbps`.
+
+## FPS real
+
+O overlay da transmissão mede frames efetivamente apresentados pelo `<video>` com `requestVideoFrameCallback()`. Portanto o valor mostrado não é apenas o FPS solicitado no preset.
+
+## Recursos preservados
+
+### Voice & Media 0.3.0
+
+- mute;
+- deafen;
+- volume individual;
+- microfone/saída/câmera selecionáveis;
+- câmera;
+- indicador de fala;
+- sensibilidade automática/manual;
+- Push-to-Talk;
+- Push-to-Mute.
+
+### Network Diagnostics 0.2.3
+
+- candidate pair ICE;
+- P2P/TURN;
+- RTT;
+- jitter;
+- packet loss;
+- bitrate real de upload/download;
+- codecs;
+- resolução/FPS recebido;
+- relatório técnico.
+
+### WebRTC Stabilization 0.2.2
+
+- tracks separadas;
+- Perfect Negotiation;
+- `negotiationneeded`;
+- ICE restart;
+- reconexão automática WebSocket/WebRTC;
+- logs RTC.
 
 ## Desenvolvimento
 
@@ -81,92 +149,20 @@ npm install
 npm run dev
 ```
 
-## Executar como Electron
-
-```powershell
-npm install
-npm start
-```
-
-## Gerar instalador/portable do Windows
+## Build Windows
 
 ```powershell
 npm install
 npm run dist:win
 ```
 
-Os artefatos são gerados em `release/`.
-
-## Fluxo do host
-
-1. Abra o Discordy.
-2. Informe seu nome.
-3. Clique em **Criar uma sala**.
-4. O aplicativo verifica `cloudflared`.
-5. Crie a sala.
-6. Copie o convite e envie aos participantes.
-7. Abra **Detalhes técnicos** para acompanhar signaling/RTC quando necessário.
-
-## Fluxo do convidado
-
-1. Abra o Discordy.
-2. Informe seu nome.
-3. Clique em **Entrar em uma sala**.
-4. Cole o convite.
-5. Entre na sala.
-
-O convidado não precisa instalar `cloudflared`.
-
-## Diagnóstico 0.2.2
-
-Os logs agora identificam a camada:
-
-```text
-[HOST] ...
-[WS] ...
-[SERVER] ...
-[RTC abc12345] ...
-[MEDIA] ...
-```
-
-Eventos importantes incluem:
-
-```text
-negotiationneeded
-SDP offer enviado
-SDP answer remoto aplicado
-ICE candidate enviado (host/srflx/relay)
-connectionState=connected
-connectionState=disconnected
-ICE restart #1 solicitado
-WebSocket reconectado
-sessão de signaling renovada
-```
+Artefatos em `release/`.
 
 ## Limitações atuais
 
-- Sem TURN: algumas combinações de NAT/firewall ainda podem impedir o P2P.
-- Máximo de 4 participantes.
-- Sem autenticação/contas/banco de dados.
-- Câmera ainda sem captura/UI, embora a camada RTC já esteja preparada.
-- Quick Tunnel continua sendo a solução temporária de signaling público.
-
-## 0.2.3 — Network Diagnostics
-
-A versão 0.2.3 adiciona diagnóstico WebRTC por peer sem alterar o transporte de mídia:
-
-- `RTCPeerConnection.getStats()`;
-- candidate pair ICE selecionado;
-- tipos `host`, `srflx`, `prflx` e `relay` quando reportados pelo Chromium;
-- classificação automática `P2P direto` ou `TURN Relay`;
-- RTT;
-- jitter;
-- packet loss;
-- bitrate de upload/download calculado por delta de bytes;
-- codecs TX/RX;
-- resolução e FPS do vídeo recebido;
-- estados `connectionState`, `iceConnectionState`, `iceGatheringState` e `signalingState`;
-- teste ativo de conexão com duas amostras;
-- relatório técnico copiável incluindo métricas e logs recentes.
-
-Abra o ícone de atividade ao lado dos logs na seção **Voz conectada**.
+- máximo de 4 participantes;
+- Mesh P2P: cada transmissor envia sua tela separadamente para cada peer;
+- um screen share ativo por participante;
+- áudio loopback do Electron é suportado diretamente no Windows; outros sistemas podem ter limitações próprias;
+- sem TURN configurado nesta etapa;
+- Quick Tunnel continua temporário para signaling público.
