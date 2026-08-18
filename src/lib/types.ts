@@ -1,5 +1,41 @@
+export type PresenceState = 'online' | 'reconnecting' | 'disconnected';
+
+
+export type ChatMessage = {
+  id: string;
+  senderId: string;
+  senderName: string;
+  text: string;
+  sentAt: number;
+};
+
 export type PeerInfo = {
   peerId: string;
+  name: string;
+  isHost?: boolean;
+  presence?: PresenceState;
+};
+
+export type ParticipantInfo = {
+  peerId: string;
+  name: string;
+  isHost: boolean;
+  presence: PresenceState;
+};
+
+export type RoomInfo = {
+  roomId: string;
+  name: string;
+  maxParticipants: 2 | 3 | 4;
+  locked: boolean;
+  pinRequired: boolean;
+  approvalRequired: boolean;
+  inviteEnabled: boolean;
+  hostPeerId: string | null;
+};
+
+export type JoinRequestInfo = {
+  requestId: string;
   name: string;
 };
 
@@ -29,16 +65,37 @@ export type SignalPayload =
   | { media: MediaStateSignal };
 
 export type ClientMessage =
-  | { type: 'join'; roomId: string; name: string }
+  | {
+      type: 'join';
+      roomId: string;
+      name: string;
+      inviteToken?: string;
+      pin?: string;
+      hostSecret?: string;
+      resumeToken?: string;
+    }
   | { type: 'signal'; target: string; data: SignalPayload }
+  | { type: 'room-update'; changes: { name?: string; maxParticipants?: number; locked?: boolean; approvalRequired?: boolean; pin?: string | null } }
+  | { type: 'kick'; peerId: string }
+  | { type: 'join-decision'; requestId: string; approved: boolean }
+  | { type: 'invite-regenerate' }
+  | { type: 'invite-invalidate' }
   | { type: 'leave' };
 
 export type ServerMessage =
-  | { type: 'welcome'; peerId: string; roomId: string; peers: PeerInfo[] }
+  | { type: 'welcome'; peerId: string; roomId: string; peers: PeerInfo[]; room: RoomInfo; participants: ParticipantInfo[]; sessionToken: string }
   | { type: 'peer-joined'; peer: PeerInfo }
   | { type: 'peer-left'; peerId: string }
+  | { type: 'participant-state'; participant: ParticipantInfo }
+  | { type: 'room-state'; room: RoomInfo }
+  | { type: 'join-pending'; requestId: string; roomName: string }
+  | { type: 'join-request'; request: JoinRequestInfo }
+  | { type: 'join-request-removed'; requestId: string }
+  | { type: 'join-denied'; message: string }
+  | { type: 'invite-updated'; enabled: boolean; inviteToken?: string }
+  | { type: 'kicked'; message: string }
   | { type: 'signal'; from: string; data: SignalPayload }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; code?: string };
 
 export type RemotePeer = PeerInfo & {
   stream: MediaStream;

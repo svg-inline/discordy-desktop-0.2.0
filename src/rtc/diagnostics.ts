@@ -1,4 +1,4 @@
-export type ConnectionRoute = 'p2p' | 'turn' | 'unknown';
+export type ConnectionRoute = 'direct' | 'nat' | 'turn' | 'unknown';
 
 export type VideoReceiveMetrics = {
   width: number | null;
@@ -85,7 +85,8 @@ function findSelectedCandidatePair(reports: Map<string, RTCStats>): RTCStats | u
 
 function deriveRoute(localType: string, remoteType: string): ConnectionRoute {
   if (localType === 'relay' || remoteType === 'relay') return 'turn';
-  if (localType !== 'unknown' || remoteType !== 'unknown') return 'p2p';
+  if (localType === 'host' && remoteType === 'host') return 'direct';
+  if (['host', 'srflx', 'prflx'].includes(localType) || ['host', 'srflx', 'prflx'].includes(remoteType)) return 'nat';
   return 'unknown';
 }
 

@@ -1,4 +1,4 @@
-import type { MediaSource, PeerInfo, RemotePeer, ScreenShareMetadata, SignalPayload } from '../lib/types';
+import type { ChatMessage, MediaSource, PeerInfo, RemotePeer, ScreenShareMetadata, SignalPayload } from '../lib/types';
 import { collectPeerDiagnostics } from './diagnostics';
 import type { PeerDiagnostics } from './diagnostics';
 
@@ -25,23 +25,39 @@ type PeerState = {
   media: Record<MediaSource, boolean>;
   mediaTrackIds: Partial<Record<MediaSource, string>>;
   screenShare: ScreenShareMetadata | null;
+  turnFallbackActive: boolean;
+  chatChannel: RTCDataChannel | null;
+  chatReady: boolean;
+  seenChatMessageIds: Set<string>;
 };
 
 type PeerManagerOptions = {
-  iceServers: RTCIceServer[];
+  rtcConfiguration: RTCConfiguration;
+  turnFallbackConfiguration?: RTCConfiguration | null;
   sendSignal: (target: string, data: SignalPayload) => boolean;
   onPeersChanged: (peers: RemotePeer[]) => void;
+  onChatMessage?: (message: ChatMessage) => void;
+  onTypingChanged?: (peerId: string, typing: boolean) => void;
+  onChatChannelChanged?: (peerId: string, ready: boolean) => void;
   onLog?: (message: string) => void;
 };
 
 const MAX_ICE_RESTART_ATTEMPTS = 3;
 const DISCONNECTED_RESTART_DELAY_MS = 3500;
+const CHAT_CHANNEL_LABEL = 'discordy-chat';
+const CHAT_PROTOCOL = 'discordy-chat-v1';
+const MAX_CHAT_MESSAGE_LENGTH = 2000;
+const MAX_CHAT_PACKET_BYTES = 8192;
 
 export class PeerManager {
   private readonly peers = new Map<string, PeerState>();
-  private readonly iceServers: RTCIceServer[];
+  private rtcConfiguration: RTCConfiguration;
+  private turnFallbackConfiguration: RTCConfiguration | null;
   private readonly sendSignal: PeerManagerOptions['sendSignal'];
   private readonly onPeersChanged: PeerManagerOptions['onPeersChanged'];
+  private readonly onChatMessage: NonNullable<PeerManagerOptions['onChatMessage']>;
+  private readonly onTypingChanged: NonNullable<PeerManagerOptions['onTypingChanged']>;
+  private readonly onChatChannelChanged: NonNullable<PeerManagerOptions['onChatChannelChanged']>;
   private readonly onLog: NonNullable<PeerManagerOptions['onLog']>;
 
   private localPeerId: string | null = null;
@@ -53,10 +69,34 @@ export class PeerManager {
   private screenBitrateKbps = 4500;
 
   constructor(options: PeerManagerOptions) {
-    this.iceServers = options.iceServers;
+    this.rtcConfiguration = { ...options.rtcConfiguration, iceServers: [...(options.rtcConfiguration.iceServers ?? [])] };
+    this.turnFallbackConfiguration = options.turnFallbackConfiguration ? { ...options.turnFallbackConfiguration, iceServers: [...(options.turnFallbackConfiguration.iceServers ?? [])] } : null;
     this.sendSignal = options.sendSignal;
     this.onPeersChanged = options.onPeersChanged;
+    this.onChatMessage = options.onChatMessage ?? (() => undefined);
+    this.onTypingChanged = options.onTypingChanged ?? (() => undefined);
+    this.onChatChannelChanged = options.onChatChannelChanged ?? (() => undefined);
     this.onLog = options.onLog ?? (() => undefined);
+  }
+
+
+  updateConnectivityConfiguration(rtcConfiguration: RTCConfiguration, turnFallbackConfiguration: RTCConfiguration | null) {
+    this.rtcConfiguration = { ...rtcConfiguration, iceServers: [...(rtcConfiguration.iceServers ?? [])] };
+    this.turnFallbackConfiguration = turnFallbackConfiguration ? { ...turnFallbackConfiguration, iceServers: [...(turnFallbackConfiguration.iceServers ?? [])] } : null;
+
+    for (const state of this.peers.values()) {
+      state.turnFallbackActive = this.rtcConfiguration.iceTransportPolicy === 'relay';
+      state.restartAttempts = 0;
+      this.clearDisconnectedTimer(state);
+      this.clearRecoveryTimer(state);
+      try {
+        state.pc.setConfiguration(this.rtcConfiguration);
+        state.pc.restartIce();
+        this.log(state.info.peerId, `configuração ICE atualizada policy=${this.rtcConfiguration.iceTransportPolicy ?? 'all'} servers=${this.rtcConfiguration.iceServers?.length ?? 0}`);
+      } catch (cause) {
+        this.log(state.info.peerId, `falha aplicando configuração ICE: ${this.errorMessage(cause)}`);
+      }
+    }
   }
 
   setLocalPeerId(peerId: string | null) {
@@ -115,7 +155,7 @@ export class PeerManager {
       return;
     }
 
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const pc = new RTCPeerConnection(this.rtcConfiguration);
     const polite = this.localPeerId ? this.localPeerId.localeCompare(info.peerId) > 0 : false;
     const state: PeerState = {
       info,
@@ -133,10 +173,15 @@ export class PeerManager {
       media: { microphone: true, camera: false, screen: false },
       mediaTrackIds: {},
       screenShare: null,
+      turnFallbackActive: this.rtcConfiguration.iceTransportPolicy === 'relay',
+      chatChannel: null,
+      chatReady: false,
+      seenChatMessageIds: new Set<string>(),
     };
 
     this.peers.set(info.peerId, state);
     this.bindPeerEvents(state);
+    this.setupChatDataChannel(state);
     this.syncLocalMedia(state);
     this.sendCurrentMediaState(info.peerId);
     this.log(info.peerId, `peer criado (${polite ? 'polite' : 'impolite'})`);
@@ -153,6 +198,8 @@ export class PeerManager {
     state.pc.ontrack = null;
     state.pc.onconnectionstatechange = null;
     state.pc.oniceconnectionstatechange = null;
+    state.pc.ondatachannel = null;
+    this.closeChatChannel(state);
     if (state.pc.signalingState !== 'closed') state.pc.close();
     this.peers.delete(peerId);
     this.log(peerId, `peer removido (${reason})`);
@@ -174,6 +221,33 @@ export class PeerManager {
     this.microphoneEnabled = true;
     this.screenShareMetadata = null;
     this.screenBitrateKbps = 4500;
+  }
+
+  sendChatMessage(message: ChatMessage): number {
+    const text = message.text.trim();
+    if (!text || text.length > MAX_CHAT_MESSAGE_LENGTH) return 0;
+    const packet = JSON.stringify({ type: 'chat-message', id: message.id, text, sentAt: message.sentAt });
+    let sent = 0;
+    for (const state of this.peers.values()) {
+      if (this.sendChatPacket(state, packet)) sent += 1;
+    }
+    this.logAll(`chat enviado para ${sent}/${this.peers.size} peer(s)`);
+    return sent;
+  }
+
+  sendTyping(typing: boolean): number {
+    const packet = JSON.stringify({ type: 'typing', typing, sentAt: Date.now() });
+    let sent = 0;
+    for (const state of this.peers.values()) {
+      if (this.sendChatPacket(state, packet)) sent += 1;
+    }
+    return sent;
+  }
+
+  getChatReadyPeerCount(): number {
+    let count = 0;
+    for (const state of this.peers.values()) if (state.chatReady) count += 1;
+    return count;
   }
 
   async getDiagnostics(): Promise<PeerDiagnostics[]> {
@@ -225,6 +299,15 @@ export class PeerManager {
 
   private bindPeerEvents(state: PeerState) {
     const { pc, info } = state;
+
+    pc.ondatachannel = (event) => {
+      if (event.channel.label !== CHAT_CHANNEL_LABEL) {
+        this.log(info.peerId, `DataChannel desconhecido ignorado: ${event.channel.label}`);
+        event.channel.close();
+        return;
+      }
+      this.bindChatChannel(state, event.channel, 'remote');
+    };
 
     pc.onnegotiationneeded = async () => {
       try {
@@ -292,6 +375,144 @@ export class PeerManager {
         this.clearRecoveryTimer(state);
       }
     };
+  }
+
+  private setupChatDataChannel(state: PeerState) {
+    if (!this.localPeerId) return;
+    const initiator = this.localPeerId.localeCompare(state.info.peerId) < 0;
+    if (!initiator) {
+      this.log(state.info.peerId, 'aguardando RTCDataChannel de chat do peer iniciador');
+      return;
+    }
+    try {
+      const channel = state.pc.createDataChannel(CHAT_CHANNEL_LABEL, {
+        ordered: true,
+        protocol: CHAT_PROTOCOL,
+      });
+      this.bindChatChannel(state, channel, 'local');
+      this.log(state.info.peerId, 'RTCDataChannel de chat criado');
+    } catch (cause) {
+      this.log(state.info.peerId, `falha criando RTCDataChannel: ${this.errorMessage(cause)}`);
+    }
+  }
+
+  private bindChatChannel(state: PeerState, channel: RTCDataChannel, origin: 'local' | 'remote') {
+    if (state.chatChannel && state.chatChannel !== channel) {
+      if (state.chatChannel.readyState === 'open') {
+        this.log(state.info.peerId, `RTCDataChannel duplicado (${origin}) descartado`);
+        channel.close();
+        return;
+      }
+      try { state.chatChannel.close(); } catch { /* noop */ }
+    }
+
+    state.chatChannel = channel;
+    channel.binaryType = 'arraybuffer';
+
+    channel.onopen = () => {
+      if (state.chatChannel !== channel) return;
+      state.chatReady = true;
+      this.onChatChannelChanged(state.info.peerId, true);
+      this.log(state.info.peerId, `RTCDataChannel chat aberto (${origin})`);
+    };
+
+    channel.onclose = () => {
+      if (state.chatChannel !== channel) return;
+      state.chatReady = false;
+      this.onTypingChanged(state.info.peerId, false);
+      this.onChatChannelChanged(state.info.peerId, false);
+      this.log(state.info.peerId, 'RTCDataChannel chat fechado');
+    };
+
+    channel.onerror = () => {
+      this.log(state.info.peerId, 'erro no RTCDataChannel de chat');
+    };
+
+    channel.onmessage = (event) => {
+      this.handleChatPacket(state, event.data);
+    };
+  }
+
+  private handleChatPacket(state: PeerState, raw: unknown) {
+    if (typeof raw !== 'string') {
+      this.log(state.info.peerId, 'pacote de chat não-textual ignorado');
+      return;
+    }
+    if (new TextEncoder().encode(raw).byteLength > MAX_CHAT_PACKET_BYTES) {
+      this.log(state.info.peerId, 'pacote de chat excedeu o limite e foi descartado');
+      return;
+    }
+
+    let packet: unknown;
+    try {
+      packet = JSON.parse(raw);
+    } catch {
+      this.log(state.info.peerId, 'JSON inválido recebido no chat');
+      return;
+    }
+    if (!packet || typeof packet !== 'object') return;
+    const value = packet as Record<string, unknown>;
+
+    if (value.type === 'typing') {
+      if (typeof value.typing !== 'boolean') return;
+      this.onTypingChanged(state.info.peerId, value.typing);
+      return;
+    }
+
+    if (value.type !== 'chat-message') return;
+    if (typeof value.id !== 'string' || value.id.length < 8 || value.id.length > 128) return;
+    if (typeof value.text !== 'string') return;
+    const text = value.text.trim();
+    if (!text || text.length > MAX_CHAT_MESSAGE_LENGTH) return;
+    if (state.seenChatMessageIds.has(value.id)) return;
+    state.seenChatMessageIds.add(value.id);
+    if (state.seenChatMessageIds.size > 500) {
+      const first = state.seenChatMessageIds.values().next().value as string | undefined;
+      if (first) state.seenChatMessageIds.delete(first);
+    }
+
+    const sentAt = typeof value.sentAt === 'number' && Number.isFinite(value.sentAt) ? value.sentAt : Date.now();
+    this.onTypingChanged(state.info.peerId, false);
+    this.onChatMessage({
+      id: value.id,
+      senderId: state.info.peerId,
+      senderName: state.info.name,
+      text,
+      sentAt,
+    });
+    this.log(state.info.peerId, `mensagem P2P recebida (${text.length} chars)`);
+  }
+
+  private sendChatPacket(state: PeerState, packet: string): boolean {
+    const channel = state.chatChannel;
+    if (!channel || channel.readyState !== 'open') return false;
+    if (channel.bufferedAmount > 1024 * 1024) {
+      this.log(state.info.peerId, 'chat aguardando: buffer do DataChannel acima de 1 MiB');
+      return false;
+    }
+    try {
+      channel.send(packet);
+      return true;
+    } catch (cause) {
+      this.log(state.info.peerId, `falha enviando chat P2P: ${this.errorMessage(cause)}`);
+      return false;
+    }
+  }
+
+  private closeChatChannel(state: PeerState) {
+    const channel = state.chatChannel;
+    state.chatChannel = null;
+    state.chatReady = false;
+    this.onTypingChanged(state.info.peerId, false);
+    this.onChatChannelChanged(state.info.peerId, false);
+    if (!channel) return;
+    channel.onopen = null;
+    channel.onclose = null;
+    channel.onerror = null;
+    channel.onmessage = null;
+    if (channel.readyState !== 'closed') {
+      try { channel.close(); } catch { /* noop */ }
+    }
   }
 
   private async handleDescription(state: PeerState, description: RTCSessionDescriptionInit) {
@@ -412,10 +633,39 @@ export class PeerManager {
     this.log(state.info.peerId, `desconectado; ICE restart em ${DISCONNECTED_RESTART_DELAY_MS}ms se não recuperar`);
   }
 
+
+  private activateTurnFallback(state: PeerState, reason: string): boolean {
+    if (!this.turnFallbackConfiguration || state.turnFallbackActive || state.pc.signalingState === 'closed') return false;
+    try {
+      state.pc.setConfiguration(this.turnFallbackConfiguration);
+      state.turnFallbackActive = true;
+      state.restartAttempts = 0;
+      state.pc.restartIce();
+      this.log(state.info.peerId, `fallback TURN ativado (${reason}); reiniciando ICE com ${this.turnFallbackConfiguration.iceServers?.length ?? 0} servidor(es)`);
+      state.recoveryTimer = window.setTimeout(() => {
+        state.recoveryTimer = null;
+        const connectionBad = state.pc.connectionState === 'failed' || state.pc.connectionState === 'disconnected';
+        const iceBad = state.pc.iceConnectionState === 'failed' || state.pc.iceConnectionState === 'disconnected';
+        if (connectionBad || iceBad) this.restartIce(state, 'turn-fallback-timeout');
+      }, 6000);
+      return true;
+    } catch (cause) {
+      this.log(state.info.peerId, `falha ativando fallback TURN: ${this.errorMessage(cause)}`);
+      return false;
+    }
+  }
+
   private restartIce(state: PeerState, reason: string) {
     if (state.pc.signalingState === 'closed' || state.recoveryTimer !== null) return;
+
+    const hardFailure = reason.includes('failed');
+    if (!state.turnFallbackActive && this.turnFallbackConfiguration && (hardFailure || state.restartAttempts >= 1)) {
+      if (this.activateTurnFallback(state, reason)) return;
+    }
+
     if (state.restartAttempts >= MAX_ICE_RESTART_ATTEMPTS) {
-      this.log(state.info.peerId, `recuperação WebRTC esgotada após ${MAX_ICE_RESTART_ATTEMPTS} ICE restart(s)`);
+      if (!state.turnFallbackActive && this.activateTurnFallback(state, 'direct-restarts-exhausted')) return;
+      this.log(state.info.peerId, `recuperação WebRTC esgotada após ${MAX_ICE_RESTART_ATTEMPTS} ICE restart(s)${state.turnFallbackActive ? ' com TURN ativo' : ''}`);
       return;
     }
     state.restartAttempts += 1;

@@ -13,14 +13,20 @@ export class HostService {
     return await this.tunnel.checkInstalled();
   }
 
-  async start() {
+  async start(options = {}) {
     await this.stop();
     this.onStatus({ phase: 'server-starting', message: 'Iniciando servidor local...' });
 
     this.signaling = await startSignalingServer({
       host: '127.0.0.1',
       port: 0,
-      maxParticipants: 4,
+      initialRoom: {
+        roomId: options.roomId,
+        name: options.roomName,
+        maxParticipants: options.maxParticipants,
+        pin: options.pin,
+        approvalRequired: options.approvalRequired,
+      },
       logger: this.logger,
     });
 
@@ -33,6 +39,13 @@ export class HostService {
         publicUrl: tunnel.publicUrl,
         port: this.signaling.port,
         cloudflaredVersion: tunnel.version,
+        room: {
+          roomId: this.signaling.roomId,
+          name: this.signaling.roomName,
+          maxParticipants: this.signaling.maxParticipants,
+        },
+        hostSecret: this.signaling.hostSecret,
+        inviteToken: this.signaling.inviteToken,
       };
     } catch (error) {
       await this.signaling.close();

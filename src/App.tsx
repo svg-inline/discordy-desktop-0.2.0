@@ -1,29 +1,54 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { RemoteVideo } from './components/RemoteVideo';
+import { ChatPanel } from './components/ChatPanel';
 import { ScreenShareTile } from './components/ScreenShareTile';
 import { createInvite, createRoomCode, parseInvite } from './lib/invite';
 import { SignalingClient } from './lib/signaling';
 import type { SignalingState } from './lib/signaling';
 import { PeerManager } from './rtc/PeerManager';
 import type { PeerDiagnostics } from './rtc/diagnostics';
-import type { RemotePeer, ScreenShareMetadata, ServerMessage } from './lib/types';
+import { configSummary, defaultIceConnectivityConfig, fallbackRtcConfiguration, initialRtcConfiguration, loadIceConnectivityConfig, normalizeIceConnectivityConfig, saveIceConnectivityConfig, testTurnConnectivity } from './rtc/iceConfig';
+import type { IceConnectivityConfig, TurnTestResult } from './rtc/iceConfig';
+import type { ChatMessage, JoinRequestInfo, ParticipantInfo, PresenceState, RemotePeer, RoomInfo, ScreenShareMetadata, ServerMessage } from './lib/types';
 import { VoiceMediaController } from './media/VoiceMediaController';
 import type { MediaDeviceCatalog, SensitivityMode, VoiceActivitySnapshot, VoiceInputMode } from './media/VoiceMediaController';
 import { SCREEN_QUALITY_PRESETS, ScreenShareController } from './media/ScreenShareController';
 import type { ScreenQualityPreset, ScreenSourceInfo } from './media/ScreenShareController';
 
-const DEFAULT_STUN = typeof import.meta.env.VITE_STUN_URL === 'string' ? import.meta.env.VITE_STUN_URL : 'stun:stun.l.google.com:19302';
-const MAX_PARTICIPANTS = 4;
-const APP_VERSION = '0.4.0';
+const DEFAULT_MAX_PARTICIPANTS = 4;
+const APP_VERSION = '0.8.0';
 
 type HomeMode = 'home' | 'host' | 'join';
 type ThemeMode = 'dark' | 'onyx';
 type DensityMode = 'comfortable' | 'compact';
 
+type DesktopPreferences = {
+  minimizeToTray: boolean;
+  closeToTray: boolean;
+  notifications: boolean;
+  launchAtStartup: boolean;
+  globalShortcuts: boolean;
+};
+
+type DesktopRuntimeState = {
+  preferences: DesktopPreferences;
+  launchAtStartupSupported: boolean;
+  notificationSupported: boolean;
+  globalHoldSupported: boolean;
+  shortcuts: {
+    mute: boolean;
+    deafen: boolean;
+    toggleWindow: boolean;
+    holdKeys: boolean;
+  };
+  windowVisible: boolean;
+};
+
 type HostState = {
   localUrl: string;
   publicUrl: string;
-  invite: string;
+  invite: string | null;
+  inviteToken: string | null;
 } | null;
 
 type IconName =
@@ -42,7 +67,8 @@ type IconName =
   | 'logs'
   | 'activity'
   | 'chevron'
-  | 'arrow';
+  | 'arrow'
+  | 'chat';
 
 const ICON_PATHS: Record<IconName, string[]> = {
   home: ['M3 11.5 12 4l9 7.5', 'M5 10.5V20h14v-9.5', 'M9 20v-6h6v6'],
@@ -61,6 +87,7 @@ const ICON_PATHS: Record<IconName, string[]> = {
   activity: ['M3 12h4l2.2-6 4.1 12 2.5-7H21'],
   chevron: ['m9 18 6-6-6-6'],
   arrow: ['M5 12h14', 'm13 6 6 6-6 6'],
+  chat: ['M4 5h16v11H8l-4 4V5Z', 'M8 9h8', 'M8 12h5'],
 };
 
 function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
@@ -88,7 +115,8 @@ function formatBitrate(value: number | null) {
 
 function routeLabel(route: PeerDiagnostics['route']) {
   if (route === 'turn') return 'TURN Relay';
-  if (route === 'p2p') return 'P2P direto';
+  if (route === 'nat') return 'P2P via NAT';
+  if (route === 'direct') return 'P2P direto';
   return 'Indeterminado';
 }
 
@@ -99,13 +127,52 @@ function videoLabel(video: PeerDiagnostics['receivedVideo']) {
   return `${size} · ${fps}`;
 }
 
+
+function presenceLabel(presence: PresenceState) {
+  if (presence === 'online') return 'Online';
+  if (presence === 'reconnecting') return 'Reconectando';
+  return 'Desconectado';
+}
+
+function createChatMessageId() {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function upsertParticipant(list: ParticipantInfo[], participant: ParticipantInfo) {
+  const index = list.findIndex((item) => item.peerId === participant.peerId);
+  if (index < 0) return [...list, participant];
+  const next = [...list];
+  next[index] = participant;
+  return next;
+}
+
 function App() {
   const [name, setName] = useState(() => localStorage.getItem('discordy:name') || '');
   const [mode, setMode] = useState<HomeMode>('home');
   const [theme, setTheme] = useState<ThemeMode>(() => (localStorage.getItem('discordy:theme') === 'onyx' ? 'onyx' : 'dark'));
   const [density, setDensity] = useState<DensityMode>(() => (localStorage.getItem('discordy:density') === 'compact' ? 'compact' : 'comfortable'));
   const [inviteInput, setInviteInput] = useState('');
+  const [joinPin, setJoinPin] = useState('');
+  const [joinPending, setJoinPending] = useState(false);
+  const [joinPendingRoomName, setJoinPendingRoomName] = useState('');
   const [roomId, setRoomId] = useState<string | null>(null);
+  const [roomInfo, setRoomInfo] = useState<RoomInfo | null>(null);
+  const [participants, setParticipants] = useState<ParticipantInfo[]>([]);
+  const [pendingJoinRequests, setPendingJoinRequests] = useState<JoinRequestInfo[]>([]);
+  const [selfPresence, setSelfPresence] = useState<PresenceState>('disconnected');
+  const [showRoomSettings, setShowRoomSettings] = useState(false);
+  const [hostRoomName, setHostRoomName] = useState(() => localStorage.getItem('discordy:host-room-name') || 'Minha sala');
+  const [hostMaxParticipants, setHostMaxParticipants] = useState<2 | 3 | 4>(() => {
+    const stored = Number(localStorage.getItem('discordy:host-max-participants') || '4');
+    return stored === 2 || stored === 3 ? stored : 4;
+  });
+  const [hostPin, setHostPin] = useState('');
+  const [hostApprovalRequired, setHostApprovalRequired] = useState(() => localStorage.getItem('discordy:host-approval-required') === 'true');
+  const [roomNameDraft, setRoomNameDraft] = useState('');
+  const [roomLimitDraft, setRoomLimitDraft] = useState<2 | 3 | 4>(4);
+  const [roomPinDraft, setRoomPinDraft] = useState('');
+  const [roomApprovalDraft, setRoomApprovalDraft] = useState(false);
   const [selfId, setSelfId] = useState<string | null>(null);
   const [serverUrl, setServerUrl] = useState<string | null>(null);
   const [hostState, setHostState] = useState<HostState>(null);
@@ -157,6 +224,17 @@ function App() {
   const [networkTesting, setNetworkTesting] = useState(false);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
   const [diagnosticsUpdatedAt, setDiagnosticsUpdatedAt] = useState<Date | null>(null);
+  const [iceConfig, setIceConfig] = useState<IceConnectivityConfig>(() => loadIceConnectivityConfig());
+  const [iceDraft, setIceDraft] = useState<IceConnectivityConfig>(() => loadIceConnectivityConfig());
+  const [turnTesting, setTurnTesting] = useState(false);
+  const [turnTestResult, setTurnTestResult] = useState<TurnTestResult | null>(null);
+  const [showChat, setShowChat] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatDraft, setChatDraft] = useState('');
+  const [chatTypingPeers, setChatTypingPeers] = useState<Record<string, boolean>>({});
+  const [chatReadyPeers, setChatReadyPeers] = useState<Record<string, boolean>>({});
+  const [chatUnread, setChatUnread] = useState(0);
+  const [desktopRuntime, setDesktopRuntime] = useState<DesktopRuntimeState | null>(null);
 
   const signalingRef = useRef<SignalingClient | null>(null);
   const peerManagerRef = useRef<PeerManager | null>(null);
@@ -168,10 +246,21 @@ function App() {
   const localPreviewRef = useRef<HTMLVideoElement | null>(null);
   const selfIdRef = useRef<string | null>(null);
   const roomIdRef = useRef<string | null>(null);
+  const leaveRef = useRef<(() => Promise<void>) | null>(null);
+  const showChatRef = useRef(false);
+  const localTypingTimerRef = useRef<number | null>(null);
+  const localTypingSentRef = useRef(false);
+
+  showChatRef.current = showChat;
 
   const appendTechnicalLog = useCallback((line: string) => {
     const timestamp = new Date().toLocaleTimeString('pt-BR', { hour12: false });
     setTechnicalLogs((logs) => [...logs.slice(-399), `[${timestamp}] ${line}`]);
+  }, []);
+
+  const notifyWhenBackground = useCallback((title: string, body: string) => {
+    if (!document.hidden && document.hasFocus()) return;
+    void window.discordy.desktop.notify({ title, body }).catch(() => undefined);
   }, []);
 
   if (!mediaControllerRef.current) {
@@ -185,27 +274,133 @@ function App() {
 
   if (!peerManagerRef.current) {
     peerManagerRef.current = new PeerManager({
-      iceServers: [{ urls: DEFAULT_STUN }],
+      rtcConfiguration: initialRtcConfiguration(iceConfig),
+      turnFallbackConfiguration: fallbackRtcConfiguration(iceConfig),
       sendSignal: (target, data) => signalingRef.current?.send({ type: 'signal', target, data }) ?? false,
       onPeersChanged: setRemotePeers,
+      onChatMessage: (message) => {
+        setChatMessages((current) => current.some((item) => item.id === message.id) ? current : [...current.slice(-499), message]);
+        setChatTypingPeers((current) => ({ ...current, [message.senderId]: false }));
+        if (!showChatRef.current) setChatUnread((current) => current + 1);
+        notifyWhenBackground(message.senderName || 'Discordy', message.text.length > 140 ? `${message.text.slice(0, 137)}...` : message.text);
+      },
+      onTypingChanged: (peerId, typing) => setChatTypingPeers((current) => ({ ...current, [peerId]: typing })),
+      onChatChannelChanged: (peerId, ready) => setChatReadyPeers((current) => ({ ...current, [peerId]: ready })),
       onLog: appendTechnicalLog,
     });
   }
+
+  const stopLocalTyping = useCallback(() => {
+    if (localTypingTimerRef.current !== null) {
+      window.clearTimeout(localTypingTimerRef.current);
+      localTypingTimerRef.current = null;
+    }
+    if (localTypingSentRef.current) {
+      peerManagerRef.current?.sendTyping(false);
+      localTypingSentRef.current = false;
+    }
+  }, []);
+
+  const updateChatDraft = useCallback((value: string) => {
+    const next = value.slice(0, 2000);
+    setChatDraft(next);
+    const typing = Boolean(next.trim());
+    if (!typing) {
+      stopLocalTyping();
+      return;
+    }
+    if (!localTypingSentRef.current) {
+      const sent = peerManagerRef.current?.sendTyping(true) ?? 0;
+      localTypingSentRef.current = sent > 0;
+    }
+    if (localTypingTimerRef.current !== null) window.clearTimeout(localTypingTimerRef.current);
+    localTypingTimerRef.current = window.setTimeout(() => {
+      localTypingTimerRef.current = null;
+      if (localTypingSentRef.current) {
+        peerManagerRef.current?.sendTyping(false);
+        localTypingSentRef.current = false;
+      }
+    }, 1400);
+  }, [stopLocalTyping]);
+
+  const sendChatMessage = useCallback(() => {
+    const text = chatDraft.trim();
+    if (!text || !selfIdRef.current) return;
+    const message: ChatMessage = {
+      id: createChatMessageId(),
+      senderId: selfIdRef.current,
+      senderName: name.trim() || 'Você',
+      text,
+      sentAt: Date.now(),
+    };
+    const sent = peerManagerRef.current?.sendChatMessage(message) ?? 0;
+    if (sent === 0) {
+      setStatus('Chat P2P ainda não está conectado');
+      appendTechnicalLog('[CHAT] mensagem não enviada: nenhum RTCDataChannel aberto');
+      return;
+    }
+    setChatMessages((current) => [...current.slice(-499), message]);
+    setChatDraft('');
+    stopLocalTyping();
+    appendTechnicalLog(`[CHAT] mensagem enviada diretamente para ${sent} peer(s)`);
+  }, [appendTechnicalLog, chatDraft, name, stopLocalTyping]);
+
+  const toggleChatPanel = useCallback(() => {
+    setShowChat((current) => {
+      const next = !current;
+      if (next) {
+        setChatUnread(0);
+        setShowRoomSettings(false);
+        setShowMediaSettings(false);
+        setShowDiagnostics(false);
+        setShowLogs(false);
+      } else {
+        stopLocalTyping();
+      }
+      return next;
+    });
+  }, [stopLocalTyping]);
 
   const handleServerMessage = useCallback(async (message: ServerMessage) => {
     const peerManager = peerManagerRef.current!;
 
     if (message.type === 'error') {
-      appendTechnicalLog(`[SERVER] ${message.message}`);
+      appendTechnicalLog(`[SERVER${message.code ? ` ${message.code}` : ''}] ${message.message}`);
+      setJoinPending(false);
       setError(message.message);
       return;
     }
 
+    if (message.type === 'join-pending') {
+      setJoinPending(true);
+      setJoinPendingRoomName(message.roomName);
+      setStatus('Aguardando aprovação do host...');
+      setError(null);
+      appendTechnicalLog(`[ROOM] solicitação ${message.requestId.slice(0, 8)} aguardando aprovação`);
+      return;
+    }
+
+    if (message.type === 'join-denied') {
+      setJoinPending(false);
+      setStatus('Entrada não aprovada');
+      setError(message.message);
+      appendTechnicalLog(`[ROOM] entrada recusada: ${message.message}`);
+      return;
+    }
+
+    if (message.type === 'kicked') {
+      appendTechnicalLog(`[ROOM] removido pelo host: ${message.message}`);
+      signalingRef.current?.close();
+      void leaveRef.current?.().then(() => setError(message.message));
+      return;
+    }
+
     if (message.type === 'welcome') {
-      const isReconnect = Boolean(selfIdRef.current && selfIdRef.current !== message.peerId);
-      if (isReconnect) {
-        appendTechnicalLog(`[RTC] sessão de signaling renovada; reconstruindo ${message.peers.length} peer(s)`);
-        peerManager.resetPeers('signaling-reconnect');
+      const hadSession = Boolean(selfIdRef.current);
+      const peerIdChanged = Boolean(selfIdRef.current && selfIdRef.current !== message.peerId);
+      if (peerIdChanged) {
+        appendTechnicalLog(`[RTC] identidade de sessão alterada; reconstruindo ${message.peers.length} peer(s)`);
+        peerManager.resetPeers('signaling-identity-changed');
       }
 
       selfIdRef.current = message.peerId;
@@ -213,22 +408,78 @@ function App() {
       peerManager.setLocalPeerId(message.peerId);
       setSelfId(message.peerId);
       setRoomId(message.roomId);
-      setStatus(isReconnect ? 'Reconectado' : 'Conectado');
+      setRoomInfo(message.room);
+      setParticipants(message.participants);
+      setRoomNameDraft(message.room.name);
+      setRoomLimitDraft(message.room.maxParticipants);
+      setRoomApprovalDraft(message.room.approvalRequired);
+      setJoinPending(false);
+      setSelfPresence('online');
+      setStatus(hadSession ? 'Reconectado' : 'Conectado');
       setError(null);
 
       for (const peer of message.peers) peerManager.createPeer(peer);
-      appendTechnicalLog(`[SERVER] welcome ${message.peerId.slice(0, 8)} em ${message.roomId}; peers=${message.peers.length}`);
+      appendTechnicalLog(`[SERVER] welcome ${message.peerId.slice(0, 8)} em ${message.roomId}; peers=${message.peers.length}; room=${message.room.name}`);
+      return;
+    }
+
+    if (message.type === 'room-state') {
+      setRoomInfo(message.room);
+      setRoomNameDraft(message.room.name);
+      setRoomLimitDraft(message.room.maxParticipants);
+      setRoomApprovalDraft(message.room.approvalRequired);
+      appendTechnicalLog(`[ROOM] estado atualizado name="${message.room.name}" limit=${message.room.maxParticipants} locked=${message.room.locked} approval=${message.room.approvalRequired}`);
+      return;
+    }
+
+    if (message.type === 'participant-state') {
+      setParticipants((current) => upsertParticipant(current, message.participant));
+      appendTechnicalLog(`[PRESENCE] ${message.participant.name} -> ${message.participant.presence}`);
+      return;
+    }
+
+    if (message.type === 'join-request') {
+      setPendingJoinRequests((current) => current.some((request) => request.requestId === message.request.requestId) ? current : [...current, message.request]);
+      appendTechnicalLog(`[ROOM] solicitação de entrada: ${message.request.name}`);
+      notifyWhenBackground('Solicitação de entrada', `${message.request.name} quer entrar na sala.`);
+      return;
+    }
+
+    if (message.type === 'join-request-removed') {
+      setPendingJoinRequests((current) => current.filter((request) => request.requestId !== message.requestId));
+      return;
+    }
+
+    if (message.type === 'invite-updated') {
+      setHostState((current) => {
+        if (!current) return current;
+        if (!message.enabled || !message.inviteToken || !roomIdRef.current) return { ...current, invite: null, inviteToken: null };
+        return {
+          ...current,
+          inviteToken: message.inviteToken,
+          invite: createInvite(current.publicUrl, roomIdRef.current, message.inviteToken),
+        };
+      });
+      setStatus(message.enabled ? 'Novo convite gerado' : 'Convite invalidado');
       return;
     }
 
     if (message.type === 'peer-joined') {
       peerManager.createPeer(message.peer);
-      appendTechnicalLog(`[SERVER] ${message.peer.name} entrou (${message.peer.peerId.slice(0, 8)})`);
+      setParticipants((current) => upsertParticipant(current, {
+        peerId: message.peer.peerId,
+        name: message.peer.name,
+        isHost: Boolean(message.peer.isHost),
+        presence: message.peer.presence ?? 'online',
+      }));
+      appendTechnicalLog(`[SERVER] ${message.peer.name} entrou (${message.peer.peerId.slice(0, 8)})${message.peer.isHost ? ' [HOST]' : ''}`);
+      notifyWhenBackground('Participante conectado', `${message.peer.name} entrou na sala.`);
       return;
     }
 
     if (message.type === 'peer-left') {
       peerManager.removePeer(message.peerId, 'peer-left');
+      setParticipants((current) => current.filter((participant) => participant.peerId !== message.peerId));
       return;
     }
 
@@ -241,16 +492,26 @@ function App() {
         setError('Falha na negociação WebRTC. Abra os detalhes técnicos para diagnóstico.');
       }
     }
-  }, [appendTechnicalLog]);
+  }, [appendTechnicalLog, notifyWhenBackground]);
 
   const handleSignalingState = useCallback((next: SignalingState, details?: { attempt?: number; delayMs?: number; reconnected?: boolean }) => {
-    if (next === 'connecting') setStatus('Conectando signaling...');
-    if (next === 'open') setStatus(details?.reconnected ? 'Reentrando na sala...' : 'Signaling conectado');
+    if (next === 'connecting') {
+      setStatus('Conectando signaling...');
+      setSelfPresence('reconnecting');
+    }
+    if (next === 'open') {
+      setStatus(details?.reconnected ? 'Reentrando na sala...' : 'Signaling conectado');
+      if (!roomIdRef.current) setSelfPresence('reconnecting');
+    }
     if (next === 'reconnecting') {
       const suffix = details?.delayMs ? ` em ${Math.ceil(details.delayMs / 1000)}s` : '';
       setStatus(`Reconectando signaling${suffix}`);
+      setSelfPresence('reconnecting');
     }
-    if (next === 'closed' && roomIdRef.current) setStatus('Signaling encerrado');
+    if (next === 'closed' && roomIdRef.current) {
+      setStatus('Signaling encerrado');
+      setSelfPresence('disconnected');
+    }
   }, []);
 
   const refreshMediaDevices = useCallback(async () => {
@@ -296,19 +557,25 @@ function App() {
     }
   }, [appendTechnicalLog, deafened, inputMode, manualSensitivityDb, micEnabled, microphoneDeviceId, refreshMediaDevices, sensitivityMode]);
 
-  const connectToRoom = useCallback(async (targetServer: string, targetRoom: string, requestedName: string) => {
+  const connectToRoom = useCallback(async (
+    targetServer: string,
+    targetRoom: string,
+    requestedName: string,
+    auth: { inviteToken?: string; pin?: string; hostSecret?: string } = {},
+  ) => {
     const cleanName = requestedName.trim().slice(0, 40);
     if (!cleanName) throw new Error('Informe seu nome.');
 
     localStorage.setItem('discordy:name', cleanName);
     setError(null);
+    setJoinPending(false);
     setStatus('Conectando...');
     await ensureMicrophone();
 
     signalingRef.current?.close();
     const signaling = new SignalingClient(targetServer, appendTechnicalLog);
     signalingRef.current = signaling;
-    signaling.setSession(targetRoom, cleanName);
+    signaling.setSession(targetRoom, cleanName, auth);
     signaling.onMessage((message) => void handleServerMessage(message));
     signaling.onStateChange(handleSignalingState);
 
@@ -330,6 +597,8 @@ function App() {
 
   const createHostedRoom = async () => {
     if (!name.trim()) return setError('Informe seu nome antes de criar a sala.');
+    if (!hostRoomName.trim()) return setError('Informe um nome para a sala.');
+    if (hostPin && !/^\d{4,12}$/.test(hostPin)) return setError('O PIN deve conter de 4 a 12 números.');
     setBusy(true);
     setError(null);
     setTechnicalLogs([]);
@@ -341,14 +610,23 @@ function App() {
       }
 
       setStatus('Preparando sala...');
-      const hosted = await window.discordy.host.start();
       const code = createRoomCode();
-      const invite = createInvite(hosted.publicUrl, code);
-      setHostState({ localUrl: hosted.localUrl, publicUrl: hosted.publicUrl, invite });
+      const hosted = await window.discordy.host.start({
+        roomId: code,
+        roomName: hostRoomName.trim(),
+        maxParticipants: hostMaxParticipants,
+        pin: hostPin || undefined,
+        approvalRequired: hostApprovalRequired,
+      });
+      const invite = createInvite(hosted.publicUrl, hosted.room.roomId, hosted.inviteToken);
+      setHostState({ localUrl: hosted.localUrl, publicUrl: hosted.publicUrl, invite, inviteToken: hosted.inviteToken });
+      setRoomPinDraft(hostPin);
       setIsHosting(true);
-      await connectToRoom(hosted.localUrl, code, name);
+      await connectToRoom(hosted.localUrl, hosted.room.roomId, name, { hostSecret: hosted.hostSecret });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Não foi possível criar a sala.');
+      setIsHosting(false);
+      setHostState(null);
       await window.discordy.host.stop().catch(() => undefined);
     } finally {
       setBusy(false);
@@ -363,7 +641,7 @@ function App() {
       const parsed = parseInvite(rawInvite);
       setHostState(null);
       setIsHosting(false);
-      await connectToRoom(parsed.serverUrl, parsed.roomId, name);
+      await connectToRoom(parsed.serverUrl, parsed.roomId, name, { inviteToken: parsed.inviteToken, pin: joinPin || undefined });
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : 'Não foi possível entrar na sala.');
     } finally {
@@ -390,15 +668,29 @@ function App() {
     setExpandedScreenKey(null);
     setScreenPickerOpen(false);
     setRemotePeers([]);
+    setParticipants([]);
+    setPendingJoinRequests([]);
+    setRoomInfo(null);
     setRemoteSpeaking({});
     setPeerVolumes({});
+    setChatMessages([]);
+    setChatDraft('');
+    setChatTypingPeers({});
+    setChatReadyPeers({});
+    setChatUnread(0);
+    setShowChat(false);
+    stopLocalTyping();
     setRoomId(null);
     setSelfId(null);
+    setSelfPresence('disconnected');
     setServerUrl(null);
     setStatus('Pronto');
+    setJoinPending(false);
+    setJoinPendingRoomName('');
     setShowLogs(false);
     setShowDiagnostics(false);
     setShowMediaSettings(false);
+    setShowRoomSettings(false);
     setDeafened(false);
     setNetworkDiagnostics([]);
     setDiagnosticsError(null);
@@ -408,23 +700,66 @@ function App() {
     setIsHosting(false);
     setHostState(null);
     setMode('home');
+  }, [isHosting, stopLocalTyping]);
+  leaveRef.current = leave;
+
+  const updateRoomSettings = useCallback(() => {
+    if (!roomInfo || !isHosting) return;
+    if (!roomNameDraft.trim()) return setError('Informe um nome válido para a sala.');
+    if (roomPinDraft && !/^\d{4,12}$/.test(roomPinDraft)) return setError('O PIN deve conter de 4 a 12 números.');
+    setError(null);
+    signalingRef.current?.send({
+      type: 'room-update',
+      changes: {
+        name: roomNameDraft.trim(),
+        maxParticipants: roomLimitDraft,
+        approvalRequired: roomApprovalDraft,
+        pin: roomPinDraft || null,
+      },
+    });
+    setStatus('Configurações da sala enviadas');
+  }, [isHosting, roomApprovalDraft, roomInfo, roomLimitDraft, roomNameDraft, roomPinDraft]);
+
+  const toggleRoomLocked = useCallback(() => {
+    if (!roomInfo || !isHosting) return;
+    signalingRef.current?.send({ type: 'room-update', changes: { locked: !roomInfo.locked } });
+  }, [isHosting, roomInfo]);
+
+  const regenerateInvite = useCallback(() => {
+    if (!isHosting) return;
+    signalingRef.current?.send({ type: 'invite-regenerate' });
   }, [isHosting]);
 
-  const toggleMic = () => {
+  const invalidateInvite = useCallback(() => {
+    if (!isHosting) return;
+    signalingRef.current?.send({ type: 'invite-invalidate' });
+  }, [isHosting]);
+
+  const kickParticipant = useCallback((peerId: string) => {
+    if (!isHosting) return;
+    signalingRef.current?.send({ type: 'kick', peerId });
+  }, [isHosting]);
+
+  const decideJoinRequest = useCallback((requestId: string, approved: boolean) => {
+    signalingRef.current?.send({ type: 'join-decision', requestId, approved });
+    setPendingJoinRequests((current) => current.filter((request) => request.requestId !== requestId));
+  }, []);
+
+  const toggleMic = useCallback(() => {
     const next = !micEnabled;
     setMicEnabled(next);
     mediaControllerRef.current?.setMuted(!next);
     peerManagerRef.current?.setMicrophoneEnabled(next && !deafened);
     appendTechnicalLog(`[VOICE] mute=${!next}`);
-  };
+  }, [appendTechnicalLog, deafened, micEnabled]);
 
-  const toggleDeafen = () => {
+  const toggleDeafen = useCallback(() => {
     const next = !deafened;
     setDeafened(next);
     mediaControllerRef.current?.setDeafened(next);
     peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !next);
     appendTechnicalLog(`[VOICE] deafen=${next}`);
-  };
+  }, [appendTechnicalLog, deafened, micEnabled]);
 
   const toggleCamera = useCallback(async () => {
     const controller = mediaControllerRef.current!;
@@ -607,7 +942,10 @@ function App() {
   };
 
   const copyInvite = async () => {
-    if (!hostState) return;
+    if (!hostState?.invite) {
+      setStatus('Convite está invalidado');
+      return;
+    }
     await window.discordy.clipboard.writeText(hostState.invite);
     setStatus('Convite copiado');
   };
@@ -657,6 +995,10 @@ function App() {
       `Modo: ${isHosting ? 'host' : 'convidado'}`,
       `Status: ${status}`,
       `Peers remotos: ${diagnostics.length}`,
+      `ICE mode: ${iceConfig.mode}`,
+      `STUN: ${iceConfig.stunUrls.join(', ') || 'nenhum'}`,
+      `TURN: ${iceConfig.turnUrls.join(', ') || 'nenhum'}`,
+      `TURN auth: ${iceConfig.turnUsername ? 'configurada' : 'não configurada'}`,
       '',
     ];
 
@@ -684,7 +1026,7 @@ function App() {
     lines.push('User-Agent:', navigator.userAgent, '', 'Logs recentes:');
     lines.push(...(technicalLogs.length ? technicalLogs.slice(-80) : ['Sem logs técnicos.']));
     return lines.join('\n');
-  }, [isHosting, serverUrl, status, technicalLogs]);
+  }, [iceConfig, isHosting, serverUrl, status, technicalLogs]);
 
   const copyTechnicalReport = useCallback(async () => {
     const diagnostics = networkDiagnostics.length > 0 ? networkDiagnostics : await refreshDiagnostics();
@@ -693,6 +1035,49 @@ function App() {
     setStatus('Relatório técnico copiado');
     appendTechnicalLog(`[DIAG] relatório técnico copiado (${diagnostics.length} peer(s))`);
   }, [appendTechnicalLog, buildTechnicalReport, networkDiagnostics, refreshDiagnostics]);
+
+  const applyIceConnectivity = useCallback(() => {
+    const normalized = normalizeIceConnectivityConfig(iceDraft);
+    if (normalized.mode === 'turn-only' && normalized.turnUrls.length === 0) {
+      setDiagnosticsError('Modo TURN obrigatório exige ao menos uma URL turn: ou turns:.');
+      return;
+    }
+    saveIceConnectivityConfig(normalized);
+    setIceConfig(normalized);
+    setIceDraft(normalized);
+    peerManagerRef.current?.updateConnectivityConfiguration(initialRtcConfiguration(normalized), fallbackRtcConfiguration(normalized));
+    setTurnTestResult(null);
+    setDiagnosticsError(null);
+    setStatus('Configuração ICE aplicada');
+    appendTechnicalLog(`[ICE] configuração aplicada: ${configSummary(normalized)}`);
+  }, [appendTechnicalLog, iceDraft]);
+
+  const restoreDefaultIceConnectivity = useCallback(() => {
+    const defaults = defaultIceConnectivityConfig();
+    setIceDraft(defaults);
+    setTurnTestResult(null);
+    appendTechnicalLog(`[ICE] defaults externos carregados: ${configSummary(defaults)}`);
+  }, [appendTechnicalLog]);
+
+  const runTurnTest = useCallback(async () => {
+    if (turnTesting) return;
+    const candidate = normalizeIceConnectivityConfig(iceDraft);
+    setTurnTesting(true);
+    setTurnTestResult(null);
+    setDiagnosticsError(null);
+    appendTechnicalLog(`[TURN] teste iniciado: ${candidate.turnUrls.join(', ') || 'sem servidor'}`);
+    try {
+      const result = await testTurnConnectivity(candidate);
+      setTurnTestResult(result);
+      appendTechnicalLog(`[TURN] teste ${result.ok ? 'OK' : 'FALHOU'} em ${Math.round(result.durationMs)}ms: ${result.message}${result.protocol ? ` protocol=${result.protocol}` : ''}`);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setTurnTestResult({ ok: false, durationMs: 0, candidateType: null, protocol: null, relayProtocol: null, address: null, port: null, message });
+      appendTechnicalLog(`[TURN] teste falhou: ${message}`);
+    } finally {
+      setTurnTesting(false);
+    }
+  }, [appendTechnicalLog, iceDraft, turnTesting]);
 
   const updateTheme = (next: ThemeMode) => {
     setTheme(next);
@@ -731,9 +1116,29 @@ function App() {
     }
   };
 
+  const updateDesktopPreference = useCallback(async <K extends keyof DesktopPreferences>(key: K, value: DesktopPreferences[K]) => {
+    try {
+      const next = await window.discordy.desktop.updatePreferences({ [key]: value });
+      setDesktopRuntime(next);
+      appendTechnicalLog(`[DESKTOP] ${key}=${String(value)}`);
+    } catch (cause) {
+      appendTechnicalLog(`[DESKTOP] falha atualizando ${key}: ${cause instanceof Error ? cause.message : String(cause)}`);
+    }
+  }, [appendTechnicalLog]);
+
   const setPeerVolume = (peerId: string, volume: number) => {
     setPeerVolumes((current) => ({ ...current, [peerId]: volume }));
   };
+
+  useEffect(() => {
+    localStorage.setItem('discordy:name', name.slice(0, 40));
+  }, [name]);
+
+  useEffect(() => {
+    localStorage.setItem('discordy:host-room-name', hostRoomName.slice(0, 60));
+    localStorage.setItem('discordy:host-max-participants', String(hostMaxParticipants));
+    localStorage.setItem('discordy:host-approval-required', String(hostApprovalRequired));
+  }, [hostApprovalRequired, hostMaxParticipants, hostRoomName]);
 
   useEffect(() => {
     if (localPreviewRef.current) localPreviewRef.current.srcObject = cameraStream;
@@ -787,16 +1192,72 @@ function App() {
       mediaControllerRef.current?.setPushToMutePressed(false);
       peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !deafened);
     };
+    const handleBlur = () => {
+      if (desktopRuntime?.preferences.globalShortcuts && desktopRuntime.shortcuts.holdKeys) return;
+      releaseShortcuts();
+    };
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
-    window.addEventListener('blur', releaseShortcuts);
+    window.addEventListener('blur', handleBlur);
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
-      window.removeEventListener('blur', releaseShortcuts);
-      releaseShortcuts();
+      window.removeEventListener('blur', handleBlur);
+      if (!(desktopRuntime?.preferences.globalShortcuts && desktopRuntime.shortcuts.holdKeys)) releaseShortcuts();
     };
-  }, [deafened, inputMode, micEnabled, pushToMuteEnabled, roomId]);
+  }, [deafened, desktopRuntime?.preferences.globalShortcuts, desktopRuntime?.shortcuts.holdKeys, inputMode, micEnabled, pushToMuteEnabled, roomId]);
+
+  useEffect(() => {
+    let active = true;
+    void window.discordy.desktop.getState().then((state) => {
+      if (!active) return;
+      setDesktopRuntime(state);
+      appendTechnicalLog(`[DESKTOP] tray=${state.preferences.closeToTray || state.preferences.minimizeToTray} startup=${state.preferences.launchAtStartup} global=${state.preferences.globalShortcuts}`);
+    }).catch((cause) => appendTechnicalLog(`[DESKTOP] falha lendo estado: ${cause instanceof Error ? cause.message : String(cause)}`));
+
+    const unsubscribeCommand = window.discordy.desktop.onCommand((command) => {
+      if (command.type === 'toggle-mute') {
+        toggleMic();
+        return;
+      }
+      if (command.type === 'toggle-deafen') {
+        toggleDeafen();
+        return;
+      }
+      if (command.type === 'ptt-down' && roomIdRef.current && inputMode === 'push-to-talk') {
+        setPushToTalkPressed(true);
+        mediaControllerRef.current?.setPushToTalkPressed(true);
+        return;
+      }
+      if (command.type === 'ptt-up') {
+        setPushToTalkPressed(false);
+        mediaControllerRef.current?.setPushToTalkPressed(false);
+        return;
+      }
+      if (command.type === 'ptm-down' && roomIdRef.current && pushToMuteEnabled) {
+        setPushToMutePressed(true);
+        mediaControllerRef.current?.setPushToMutePressed(true);
+        peerManagerRef.current?.setMicrophoneEnabled(false);
+        return;
+      }
+      if (command.type === 'ptm-up') {
+        setPushToMutePressed(false);
+        mediaControllerRef.current?.setPushToMutePressed(false);
+        peerManagerRef.current?.setMicrophoneEnabled(micEnabled && !deafened);
+      }
+    });
+    const unsubscribePreferences = window.discordy.desktop.onPreferencesChanged((state) => setDesktopRuntime(state));
+
+    return () => {
+      active = false;
+      unsubscribeCommand();
+      unsubscribePreferences();
+    };
+  }, [appendTechnicalLog, deafened, inputMode, micEnabled, pushToMuteEnabled, toggleDeafen, toggleMic]);
+
+  useEffect(() => {
+    window.discordy.desktop.updateMediaState({ micEnabled, deafened });
+  }, [deafened, micEnabled]);
 
   useEffect(() => {
     if (!expandedScreenKey) return;
@@ -835,21 +1296,31 @@ function App() {
   }, [appendTechnicalLog, checkCloudflared, name, roomId]);
 
   useEffect(() => () => {
+    stopLocalTyping();
     signalingRef.current?.close();
     peerManagerRef.current?.reset();
     void mediaControllerRef.current?.destroy();
     screenStreamRef.current?.getTracks().forEach((track) => track.stop());
-  }, []);
+  }, [stopLocalTyping]);
 
   const rootClassName = `discordy-root theme-${theme} density-${density}`;
 
   if (roomId) {
-    const totalParticipants = remotePeers.length + 1;
+    const fallbackParticipants: ParticipantInfo[] = [
+      { peerId: selfId || 'local', name: name || 'Você', isHost: isHosting, presence: selfPresence },
+      ...remotePeers.map((peer) => ({ peerId: peer.peerId, name: peer.name, isHost: Boolean(peer.isHost), presence: peer.presence ?? (peer.connectionState === 'connected' ? 'online' : 'reconnecting') as PresenceState })),
+    ];
+    const listedParticipants = (participants.length ? participants : fallbackParticipants).map((participant) => participant.peerId === selfId ? { ...participant, presence: selfPresence } : participant);
+    const totalParticipants = listedParticipants.length;
+    const roomLimit = roomInfo?.maxParticipants ?? DEFAULT_MAX_PARTICIPANTS;
+    const roomDisplayName = roomInfo?.name || `Sala ${roomId}`;
     const inputLevelPercent = Math.max(0, Math.min(100, ((voiceActivity.levelDb + 80) / 60) * 100));
     const thresholdPercent = Math.max(0, Math.min(100, ((voiceActivity.thresholdDb + 80) / 60) * 100));
     const remoteScreenPeers = remotePeers.filter((peer) => peer.media.screen && peer.stream.getVideoTracks().some((track) => track.readyState === 'live' && (!peer.mediaTrackIds.screen || track.id === peer.mediaTrackIds.screen)));
     const screenShareCount = remoteScreenPeers.length + (screenStream ? 1 : 0);
     const hasScreenShares = screenShareCount > 0;
+    const chatReadyCount = remotePeers.reduce((count, peer) => count + (chatReadyPeers[peer.peerId] ? 1 : 0), 0);
+    const typingNames = remotePeers.filter((peer) => chatTypingPeers[peer.peerId]).map((peer) => peer.name);
 
     return (
       <main className={rootClassName}>
@@ -857,7 +1328,7 @@ function App() {
           <aside className="server-rail" aria-label="Navegação de salas">
             <button className="rail-button rail-button--brand" title="Discordy" aria-label="Discordy"><span>D</span></button>
             <div className="rail-separator" />
-            <button className="rail-button rail-button--room rail-button--active" title={`Sala ${roomId}`} aria-label={`Sala ${roomId}`}>
+            <button className="rail-button rail-button--room rail-button--active" title={roomDisplayName} aria-label={roomDisplayName}>
               <span>{roomId.slice(0, 2).toUpperCase()}</span>
             </button>
             <button className="rail-button rail-button--add" title="Crie outra sala depois de sair" aria-label="Nova sala" disabled><Icon name="plus" /></button>
@@ -866,8 +1337,8 @@ function App() {
           <aside className="room-sidebar">
             <header className="sidebar-room-header">
               <div>
-                <strong>Sala {roomId}</strong>
-                <span>{isHosting ? 'Hospedada neste PC' : 'Sala privada'}</span>
+                <strong>{roomDisplayName}</strong>
+                <span>{isHosting ? 'Hospedada neste PC' : roomInfo?.locked ? 'Entrada bloqueada' : 'Sala privada'}</span>
               </div>
               <Icon name="chevron" size={16} />
             </header>
@@ -896,10 +1367,27 @@ function App() {
               </section>
 
               {hostState && (
-                <section className="sidebar-card">
+                <section className={`sidebar-card ${!hostState.invite ? 'sidebar-card--muted' : ''}`}>
                   <div className="sidebar-card__title"><Icon name="users" size={15} /><strong>Convite da sala</strong></div>
-                  <p>{hostState.publicUrl.replace(/^https?:\/\//, '')}</p>
-                  <button className="sidebar-action" onClick={() => void copyInvite()}><Icon name="copy" size={15} />Copiar convite</button>
+                  <p>{hostState.invite ? hostState.publicUrl.replace(/^https?:\/\//, '') : 'Convite invalidado'}</p>
+                  <div className="sidebar-card__actions">
+                    <button className="sidebar-action" disabled={!hostState.invite} onClick={() => void copyInvite()}><Icon name="copy" size={15} />Copiar</button>
+                    <button className="sidebar-action sidebar-action--secondary" onClick={regenerateInvite}>Novo</button>
+                  </div>
+                </section>
+              )}
+
+              {isHosting && pendingJoinRequests.length > 0 && (
+                <section className="sidebar-card join-requests-card">
+                  <div className="sidebar-card__title"><Icon name="users" size={15} /><strong>Solicitações</strong><span className="request-count">{pendingJoinRequests.length}</span></div>
+                  {pendingJoinRequests.map((request) => (
+                    <div className="join-request-row" key={request.requestId}>
+                      <span className="avatar avatar--xs avatar--remote">{initialFor(request.name)}</span>
+                      <div><strong>{request.name}</strong><small>Quer entrar na sala</small></div>
+                      <button className="request-button request-button--approve" onClick={() => decideJoinRequest(request.requestId, true)}>Aceitar</button>
+                      <button className="request-button" onClick={() => decideJoinRequest(request.requestId, false)}>Recusar</button>
+                    </div>
+                  ))}
                 </section>
               )}
             </div>
@@ -909,8 +1397,8 @@ function App() {
                 <div className="voice-status-row">
                   <div><span className="connection-dot" /><strong>Voz conectada</strong><small>WebRTC P2P · {status}</small></div>
                   <div className="voice-status-tools">
-                    <button className={`icon-button icon-button--small ${showDiagnostics ? 'is-active' : ''}`} title="Diagnóstico de rede" onClick={() => { setShowDiagnostics((value) => !value); setShowLogs(false); setShowMediaSettings(false); }}><Icon name="activity" size={16} /></button>
-                    <button className={`icon-button icon-button--small ${showLogs ? 'is-active' : ''}`} title="Logs técnicos" onClick={() => { setShowLogs((value) => !value); setShowDiagnostics(false); setShowMediaSettings(false); }}><Icon name="logs" size={16} /></button>
+                    <button className={`icon-button icon-button--small ${showDiagnostics ? 'is-active' : ''}`} title="Diagnóstico de rede" onClick={() => { setShowDiagnostics((value) => !value); setShowLogs(false); setShowMediaSettings(false); setShowRoomSettings(false); setShowChat(false); stopLocalTyping(); }}><Icon name="activity" size={16} /></button>
+                    <button className={`icon-button icon-button--small ${showLogs ? 'is-active' : ''}`} title="Logs técnicos" onClick={() => { setShowLogs((value) => !value); setShowDiagnostics(false); setShowMediaSettings(false); setShowRoomSettings(false); setShowChat(false); stopLocalTyping(); }}><Icon name="logs" size={16} /></button>
                   </div>
                 </div>
                 <div className="voice-status-actions">
@@ -924,7 +1412,7 @@ function App() {
                 <div className="current-user-copy"><strong>{name || 'Você'}</strong><span>{selfId ? `#${selfId.slice(0, 4)}` : 'local'}</span></div>
                 <button className={`icon-button icon-button--small ${!micEnabled ? 'is-danger' : ''}`} title={micEnabled ? 'Silenciar microfone' : 'Ativar microfone'} onClick={toggleMic}><Icon name={micEnabled ? 'mic' : 'micOff'} size={17} /></button>
                 <button className={`icon-button icon-button--small ${deafened ? 'is-danger' : ''}`} title={deafened ? 'Ativar áudio' : 'Deafen'} onClick={toggleDeafen}><Icon name="headphones" size={17} /></button>
-                <button className={`icon-button icon-button--small ${showMediaSettings ? 'is-active' : ''}`} title="Voz e vídeo" onClick={() => { setShowMediaSettings((value) => !value); setShowDiagnostics(false); setShowLogs(false); void refreshMediaDevices(); }}><Icon name="settings" size={17} /></button>
+                <button className={`icon-button icon-button--small ${showMediaSettings ? 'is-active' : ''}`} title="Voz e vídeo" onClick={() => { setShowMediaSettings((value) => !value); setShowDiagnostics(false); setShowLogs(false); setShowRoomSettings(false); setShowChat(false); stopLocalTyping(); void refreshMediaDevices(); }}><Icon name="settings" size={17} /></button>
               </section>
             </div>
           </aside>
@@ -935,16 +1423,35 @@ function App() {
                 <Icon name="volume" size={19} />
                 <strong>Geral</strong>
                 <span className="topbar-divider" />
-                <span>Sala {roomId}</span>
+                <span>{roomDisplayName}</span>
+                <small className="room-code-label">{roomId}</small>
               </div>
               <div className="topbar-actions">
-                <span className="participant-count"><Icon name="users" size={17} />{totalParticipants}</span>
-                {hostState && <button className="topbar-button" onClick={() => void copyInvite()} title="Copiar convite"><Icon name="copy" size={17} /><span>Convidar</span></button>}
+                <span className="participant-count"><Icon name="users" size={17} />{totalParticipants}/{roomLimit}</span>
+                <button className={`topbar-button chat-toggle ${showChat ? 'is-active' : ''}`} onClick={toggleChatPanel} title="Chat P2P">
+                  <Icon name="chat" size={17} /><span>Chat</span>{chatUnread > 0 && <b className="chat-unread">{chatUnread > 99 ? '99+' : chatUnread}</b>}
+                </button>
+                {isHosting && <button className={`topbar-button ${showRoomSettings ? 'is-active' : ''}`} onClick={() => { setShowRoomSettings((value) => !value); setShowMediaSettings(false); setShowDiagnostics(false); setShowLogs(false); setShowChat(false); stopLocalTyping(); }} title="Gerenciar sala"><Icon name="settings" size={17} /><span>Gerenciar</span></button>}
+                {hostState?.invite && <button className="topbar-button" onClick={() => void copyInvite()} title="Copiar convite"><Icon name="copy" size={17} /><span>Convidar</span></button>}
               </div>
             </header>
 
-            <div className="stage-content">
+            <div className={`stage-content ${hasScreenShares ? 'stage-content--with-screen' : ''}`}>
               {error && <div className="alert alert--stage">{error}</div>}
+
+              {showChat && (
+                <ChatPanel
+                  messages={chatMessages}
+                  selfId={selfId}
+                  draft={chatDraft}
+                  typingNames={typingNames}
+                  readyPeerCount={chatReadyCount}
+                  remotePeerCount={remotePeers.length}
+                  onDraftChange={updateChatDraft}
+                  onSend={sendChatMessage}
+                  onClose={toggleChatPanel}
+                />
+              )}
 
               {screenPickerOpen && (
                 <section className="screen-picker-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setScreenPickerOpen(false); }}>
@@ -975,6 +1482,55 @@ function App() {
                           <span className="screen-source-card__copy"><strong>{source.name}</strong><small>{source.type === 'monitor' ? 'Monitor' : 'Janela'}</small></span>
                         </button>
                       ))}
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {showRoomSettings && isHosting && roomInfo && (
+                <section className="media-settings-drawer room-settings-drawer">
+                  <div className="media-settings__header">
+                    <div><strong>Gerenciar sala</strong><span>Identidade, acesso e convite</span></div>
+                    <button className="text-button" onClick={() => setShowRoomSettings(false)}>Fechar</button>
+                  </div>
+                  <div className="media-settings__body room-settings__body">
+                    <div className="settings-group">
+                      <strong>Sala</strong>
+                      <label>Nome da sala
+                        <input value={roomNameDraft} maxLength={60} onChange={(event) => setRoomNameDraft(event.target.value)} />
+                      </label>
+                      <label>Limite de participantes
+                        <select value={roomLimitDraft} onChange={(event) => setRoomLimitDraft(Number(event.target.value) as 2 | 3 | 4)}>
+                          <option value={2}>2 participantes</option>
+                          <option value={3}>3 participantes</option>
+                          <option value={4}>4 participantes</option>
+                        </select>
+                      </label>
+                      <label>PIN opcional
+                        <input type="password" inputMode="numeric" value={roomPinDraft} maxLength={12} onChange={(event) => setRoomPinDraft(event.target.value.replace(/\D/g, '').slice(0, 12))} placeholder={roomInfo.pinRequired ? 'PIN atual configurado' : 'Sem PIN'} />
+                      </label>
+                      <label className="settings-checkbox"><input type="checkbox" checked={roomApprovalDraft} onChange={(event) => setRoomApprovalDraft(event.target.checked)} /><span>Exigir confirmação do host para entrar</span></label>
+                      <button className="button button--primary" onClick={updateRoomSettings}>Salvar configurações</button>
+                    </div>
+
+                    <div className="settings-group">
+                      <strong>Controle de entrada</strong>
+                      <div className="room-access-state">
+                        <span className={`room-state-dot ${roomInfo.locked ? 'is-locked' : ''}`} />
+                        <div><strong>{roomInfo.locked ? 'Entrada bloqueada' : 'Entrada liberada'}</strong><small>{roomInfo.locked ? 'Novos participantes não podem entrar.' : 'Convites válidos podem solicitar entrada.'}</small></div>
+                        <button className={`button ${roomInfo.locked ? 'button--primary' : ''}`} onClick={toggleRoomLocked}>{roomInfo.locked ? 'Desbloquear' : 'Bloquear'}</button>
+                      </div>
+                    </div>
+
+                    <div className="settings-group">
+                      <strong>Convite</strong>
+                      <div className="room-invite-state">
+                        <div><strong>{roomInfo.inviteEnabled ? 'Convite ativo' : 'Convite invalidado'}</strong><small>Gerar um novo convite invalida imediatamente o link anterior.</small></div>
+                        <div className="actions">
+                          <button className="button" onClick={regenerateInvite}>Gerar novo convite</button>
+                          <button className="button button--danger-subtle" disabled={!roomInfo.inviteEnabled} onClick={invalidateInvite}>Invalidar convite</button>
+                        </div>
+                      </div>
                     </div>
                   </div>
                 </section>
@@ -1042,6 +1598,27 @@ function App() {
                       {pushToMuteEnabled && <div className={`shortcut-state ${pushToMutePressed ? 'is-danger' : ''}`}><kbd>M</kbd><span>{pushToMutePressed ? 'Microfone temporariamente fechado' : 'Segure M para silenciar'}</span></div>}
                     </div>
 
+                    {desktopRuntime && (
+                      <div className="settings-group desktop-settings-group">
+                        <div className="settings-row settings-row--between"><strong>Experiência desktop</strong><span>Bandeja, Windows e atalhos</span></div>
+                        <div className="desktop-toggle-list">
+                          <div className="settings-row settings-row--between"><div><strong>Minimizar para bandeja</strong><small>O botão minimizar oculta a janela e mantém a chamada ativa.</small></div><label className="switch-control"><input type="checkbox" checked={desktopRuntime.preferences.minimizeToTray} onChange={(event) => void updateDesktopPreference('minimizeToTray', event.target.checked)} /><span /></label></div>
+                          <div className="settings-row settings-row--between"><div><strong>Fechar para bandeja</strong><small>Fechar a janela não encerra o Discordy.</small></div><label className="switch-control"><input type="checkbox" checked={desktopRuntime.preferences.closeToTray} onChange={(event) => void updateDesktopPreference('closeToTray', event.target.checked)} /><span /></label></div>
+                          <div className="settings-row settings-row--between"><div><strong>Notificações nativas</strong><small>Mensagens, participantes e solicitações quando o app estiver em segundo plano.</small></div><label className="switch-control"><input type="checkbox" checked={desktopRuntime.preferences.notifications} disabled={!desktopRuntime.notificationSupported} onChange={(event) => void updateDesktopPreference('notifications', event.target.checked)} /><span /></label></div>
+                          <div className="settings-row settings-row--between"><div><strong>Iniciar com o Windows</strong><small>{desktopRuntime.launchAtStartupSupported ? 'Inicia oculto na bandeja.' : 'Disponível no aplicativo empacotado/instalado.'}</small></div><label className="switch-control"><input type="checkbox" checked={desktopRuntime.preferences.launchAtStartup} disabled={!desktopRuntime.launchAtStartupSupported} onChange={(event) => void updateDesktopPreference('launchAtStartup', event.target.checked)} /><span /></label></div>
+                          <div className="settings-row settings-row--between"><div><strong>Atalhos globais</strong><small>Funcionam mesmo com o Discordy minimizado.</small></div><label className="switch-control"><input type="checkbox" checked={desktopRuntime.preferences.globalShortcuts} onChange={(event) => void updateDesktopPreference('globalShortcuts', event.target.checked)} /><span /></label></div>
+                        </div>
+                        <div className="desktop-shortcuts-list">
+                          <div><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>M</kbd><small>Mute</small></div>
+                          <div><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>D</kbd><small>Deafen</small></div>
+                          <div><kbd>Ctrl</kbd><span>+</span><kbd>Shift</kbd><span>+</span><kbd>Espaço</kbd><small>Mostrar/ocultar</small></div>
+                          <div><kbd>V</kbd><small>Push-to-Talk pressionar/soltar</small></div>
+                          <div><kbd>M</kbd><small>Push-to-Mute pressionar/soltar</small></div>
+                        </div>
+                        <small className="desktop-runtime-note">Atalhos: mute {desktopRuntime.shortcuts.mute ? '✓' : '×'} · deafen {desktopRuntime.shortcuts.deafen ? '✓' : '×'} · janela {desktopRuntime.shortcuts.toggleWindow ? '✓' : '×'} · PTT global {desktopRuntime.shortcuts.holdKeys ? '✓' : desktopRuntime.globalHoldSupported ? '×' : 'n/d'}</small>
+                      </div>
+                    )}
+
                     <div className="settings-group">
                       <div className="settings-row settings-row--between"><strong>Compartilhamento de tela</strong><span>{screenStream ? 'Transmitindo' : 'Pronto'}</span></div>
                       <label>Qualidade
@@ -1086,6 +1663,46 @@ function App() {
                     </div>
                   </div>
                   <div className="network-drawer__body">
+                    <section className="connectivity-settings">
+                      <div className="connectivity-settings__header">
+                        <div><strong>STUN / TURN</strong><span>Ativo: {configSummary(iceConfig)}</span></div>
+                        <span className={`connectivity-mode connectivity-mode--${iceConfig.mode}`}>{iceConfig.mode === 'auto' ? 'Fallback automático' : iceConfig.mode === 'turn-only' ? 'TURN obrigatório' : 'Somente P2P'}</span>
+                      </div>
+                      <div className="connectivity-grid">
+                        <label>Modo de conectividade
+                          <select value={iceDraft.mode} onChange={(event) => setIceDraft((current) => ({ ...current, mode: event.target.value as IceConnectivityConfig['mode'] }))}>
+                            <option value="auto">Automático — P2P → TURN</option>
+                            <option value="p2p-only">Somente P2P / STUN</option>
+                            <option value="turn-only">Somente TURN / relay</option>
+                          </select>
+                        </label>
+                        <label>STUN URLs <small>Uma por linha</small>
+                          <textarea rows={3} value={iceDraft.stunUrls.join('\n')} onChange={(event) => setIceDraft((current) => ({ ...current, stunUrls: event.target.value.split(/[\n,;]+/).map((value) => value.trim()).filter(Boolean) }))} placeholder="stun:stun.example.com:3478" />
+                        </label>
+                        <label className="connectivity-grid__wide">TURN URLs <small>Compatível com Coturn · turn: e turns:</small>
+                          <textarea rows={3} value={iceDraft.turnUrls.join('\n')} onChange={(event) => setIceDraft((current) => ({ ...current, turnUrls: event.target.value.split(/[\n,;]+/).map((value) => value.trim()).filter(Boolean) }))} placeholder={'turn:turn.example.com:3478?transport=udp\nturns:turn.example.com:5349?transport=tcp'} />
+                        </label>
+                        <label>Usuário TURN
+                          <input value={iceDraft.turnUsername} onChange={(event) => setIceDraft((current) => ({ ...current, turnUsername: event.target.value }))} placeholder="discordy" autoComplete="off" />
+                        </label>
+                        <label>Credencial TURN
+                          <input type="password" value={iceDraft.turnCredential} onChange={(event) => setIceDraft((current) => ({ ...current, turnCredential: event.target.value }))} placeholder="senha / credencial" autoComplete="new-password" />
+                        </label>
+                      </div>
+                      <div className="connectivity-actions">
+                        <button className="button button--compact" onClick={applyIceConnectivity}>Salvar e aplicar</button>
+                        <button className="button button--compact" disabled={turnTesting || iceDraft.turnUrls.length === 0} onClick={() => void runTurnTest()}>{turnTesting ? 'Testando TURN...' : 'Testar TURN'}</button>
+                        <button className="text-button" onClick={restoreDefaultIceConnectivity}>Carregar defaults externos</button>
+                      </div>
+                      <p className="connectivity-note">No modo Automático, o Discordy inicia com STUN/P2P e só adiciona o TURN após falha ICE. Credenciais temporárias via serviço de autenticação ficam reservadas para uma versão futura.</p>
+                      {turnTestResult && (
+                        <div className={`turn-test-result ${turnTestResult.ok ? 'is-success' : 'is-error'}`}>
+                          <strong>{turnTestResult.ok ? 'TURN operacional' : 'TURN indisponível'}</strong>
+                          <span>{turnTestResult.message}</span>
+                          <small>{Math.round(turnTestResult.durationMs)} ms{turnTestResult.protocol ? ` · ${turnTestResult.protocol}` : ''}{turnTestResult.relayProtocol ? `/${turnTestResult.relayProtocol}` : ''}{turnTestResult.address ? ` · ${turnTestResult.address}${turnTestResult.port ? `:${turnTestResult.port}` : ''}` : ''}</small>
+                        </div>
+                      )}
+                    </section>
                     {diagnosticsError && <div className="network-empty network-empty--error">{diagnosticsError}</div>}
                     {!diagnosticsError && networkDiagnostics.length === 0 && <div className="network-empty">Nenhum peer remoto conectado. O diagnóstico passa a coletar dados quando outro participante entra.</div>}
                     {networkDiagnostics.map((peer) => (
@@ -1193,29 +1810,40 @@ function App() {
           </section>
 
           <aside className="members-sidebar">
-            <header className="members-header"><strong>Participantes</strong><span>{totalParticipants}/{MAX_PARTICIPANTS}</span></header>
+            <header className="members-header"><strong>Participantes</strong><span>{totalParticipants}/{roomLimit}</span></header>
             <div className="members-list">
               <div className="members-group-title">NA SALA — {totalParticipants}</div>
-              <div className="member-row">
-                <span className="avatar avatar--sm">{initialFor(name)}</span>
-                <div><strong>{name || 'Você'}</strong><span>{isHosting ? 'Host · conectado' : 'Você · conectado'}</span></div>
-                <span className="presence-dot" />
-              </div>
-              {remotePeers.map((peer) => (
-                <div className={`member-entry ${remoteSpeaking[peer.peerId] ? 'is-speaking' : ''}`} key={peer.peerId}>
-                  <div className="member-row">
-                    <span className="avatar avatar--sm avatar--remote">{initialFor(peer.name)}</span>
-                    <div><strong>{peer.name}</strong><span>{peer.media.screen ? 'Transmitindo tela' : remoteSpeaking[peer.peerId] ? 'Falando' : peer.connectionState === 'connected' ? 'Conectado' : peer.connectionState}</span></div>
-                    {!peer.media.microphone && <Icon name="micOff" size={13} />}
-                    <span className={`presence-dot ${peer.connectionState !== 'connected' ? 'presence-dot--idle' : ''}`} />
+              {listedParticipants.map((participant) => {
+                const isSelf = participant.peerId === selfId || (!selfId && participant.peerId === 'local');
+                const peer = remotePeers.find((candidate) => candidate.peerId === participant.peerId);
+                const speaking = isSelf ? voiceActivity.speaking : Boolean(remoteSpeaking[participant.peerId]);
+                const detail = participant.isHost
+                  ? `Host · ${presenceLabel(participant.presence).toLowerCase()}`
+                  : peer?.media.screen
+                    ? 'Transmitindo tela'
+                    : speaking
+                      ? 'Falando'
+                      : presenceLabel(participant.presence);
+                return (
+                  <div className={`member-entry ${speaking ? 'is-speaking' : ''} presence-${participant.presence}`} key={participant.peerId}>
+                    <div className="member-row">
+                      <span className={`avatar avatar--sm ${isSelf ? '' : 'avatar--remote'}`}>{initialFor(participant.name)}</span>
+                      <div className="member-copy"><strong>{participant.name}{isSelf ? ' (você)' : ''}</strong><span>{detail}</span></div>
+                      {participant.isHost && <span className="host-badge">HOST</span>}
+                      {peer && !peer.media.microphone && <Icon name="micOff" size={13} />}
+                      <span className={`presence-dot presence-dot--${participant.presence}`} />
+                      {isHosting && !isSelf && !participant.isHost && <button className="kick-button" title={`Expulsar ${participant.name}`} onClick={() => kickParticipant(participant.peerId)}>Expulsar</button>}
+                    </div>
+                    {!isSelf && peer && (
+                      <label className="member-volume"><Icon name="volume" size={13} /><input type="range" min="0" max="100" step="5" value={peerVolumes[participant.peerId] ?? 100} onChange={(event) => setPeerVolume(participant.peerId, Number(event.target.value))} /><span>{peerVolumes[participant.peerId] ?? 100}%</span></label>
+                    )}
                   </div>
-                  <label className="member-volume"><Icon name="volume" size={13} /><input type="range" min="0" max="100" step="5" value={peerVolumes[peer.peerId] ?? 100} onChange={(event) => setPeerVolume(peer.peerId, Number(event.target.value))} /><span>{peerVolumes[peer.peerId] ?? 100}%</span></label>
-                </div>
-              ))}
+                );
+              })}
             </div>
             <footer className="members-footer">
               <span>{isHosting ? 'Servidor local + Quick Tunnel' : 'Conectado por convite'}</span>
-              <small>{serverUrl}</small>
+              <small>{roomInfo?.locked ? 'Entrada bloqueada · ' : ''}{serverUrl}</small>
             </footer>
           </aside>
         </div>
@@ -1256,7 +1884,7 @@ function App() {
             <section className="welcome-card">
               <div className="welcome-card__intro">
                 <div className="welcome-logo">D</div>
-                <p className="eyebrow">Discordy Desktop 0.4.0</p>
+                <p className="eyebrow">Discordy Desktop 0.7.0</p>
                 <h1>Sua sala privada, direto entre os participantes.</h1>
                 <p>WebRTC P2P para voz e compartilhamento de tela, com signaling hospedado pelo próprio host.</p>
               </div>
@@ -1285,6 +1913,12 @@ function App() {
                 <div className="flow-section">
                   <button className="back-link" onClick={() => setMode('home')}>← Voltar</button>
                   <div className="flow-heading"><span className="action-card__icon"><Icon name="plus" size={20} /></span><div><strong>Criar sala neste PC</strong><small>O signaling será iniciado localmente.</small></div></div>
+                  <div className="room-create-fields">
+                    <label>Nome da sala<input value={hostRoomName} maxLength={60} onChange={(event) => setHostRoomName(event.target.value)} placeholder="Sala dos amigos" /></label>
+                    <label>Limite<select value={hostMaxParticipants} onChange={(event) => setHostMaxParticipants(Number(event.target.value) as 2 | 3 | 4)}><option value={2}>2 participantes</option><option value={3}>3 participantes</option><option value={4}>4 participantes</option></select></label>
+                    <label>PIN opcional<input type="password" inputMode="numeric" value={hostPin} maxLength={12} onChange={(event) => setHostPin(event.target.value.replace(/\D/g, '').slice(0, 12))} placeholder="4–12 números" /></label>
+                    <label className="settings-checkbox room-create-checkbox"><input type="checkbox" checked={hostApprovalRequired} onChange={(event) => setHostApprovalRequired(event.target.checked)} /><span>Confirmar cada entrada manualmente</span></label>
+                  </div>
                   <div className={`dependency ${cloudflared?.installed ? 'dependency--ok' : 'dependency--missing'}`}>
                     <span className="dependency-dot" />
                     <div><strong>{cloudflared?.installed ? 'Cloudflared encontrado' : 'Cloudflared não encontrado'}</strong><span>{cloudflared?.version || 'Necessário somente para hospedar.'}</span></div>
@@ -1299,11 +1933,13 @@ function App() {
 
               {mode === 'join' && (
                 <div className="flow-section">
-                  <button className="back-link" onClick={() => setMode('home')}>← Voltar</button>
+                  <button className="back-link" onClick={() => { signalingRef.current?.close(); signalingRef.current = null; setJoinPending(false); setError(null); setMode('home'); }}>← Voltar</button>
                   <div className="flow-heading"><span className="action-card__icon"><Icon name="arrow" size={20} /></span><div><strong>Entrar por convite</strong><small>Quem entra não precisa do Cloudflared.</small></div></div>
                   <form onSubmit={submitJoin} className="join-form">
                     <label>Convite<input value={inviteInput} onChange={(event) => setInviteInput(event.target.value)} placeholder="discordy://join?..." autoFocus /></label>
-                    <button className="button button--primary button--large" disabled={busy}>{busy ? 'Conectando...' : 'Entrar na sala'}</button>
+                    <label>PIN da sala <span className="optional-label">opcional</span><input type="password" inputMode="numeric" value={joinPin} maxLength={12} onChange={(event) => setJoinPin(event.target.value.replace(/\D/g, '').slice(0, 12))} placeholder="Informe apenas se a sala exigir" /></label>
+                    {joinPending && <div className="join-pending-state"><span className="presence-spinner" /><div><strong>Aguardando aprovação</strong><small>{joinPendingRoomName || 'O host precisa confirmar sua entrada.'}</small></div></div>}
+                    <button className="button button--primary button--large" disabled={busy || joinPending}>{joinPending ? 'Aguardando host...' : busy ? 'Conectando...' : 'Entrar na sala'}</button>
                   </form>
                 </div>
               )}
@@ -1312,7 +1948,7 @@ function App() {
 
               <div className="welcome-card__footer">
                 <span><span className="connection-dot" />WebRTC Mesh</span>
-                <span>Até {MAX_PARTICIPANTS} participantes</span>
+                <span>Até {DEFAULT_MAX_PARTICIPANTS} participantes</span>
               </div>
             </section>
           </div>

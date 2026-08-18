@@ -7,6 +7,10 @@ type StateHandler = (state: SignalingState, details?: { attempt?: number; delayM
 type SessionContext = {
   roomId: string;
   name: string;
+  inviteToken?: string;
+  pin?: string;
+  hostSecret?: string;
+  resumeToken?: string;
 };
 
 function createWebSocketUrl(baseUrl: string) {
@@ -35,8 +39,8 @@ export class SignalingClient {
     private readonly onLog: (message: string) => void = () => undefined,
   ) {}
 
-  setSession(roomId: string, name: string) {
-    this.session = { roomId, name };
+  setSession(roomId: string, name: string, auth: Omit<SessionContext, 'roomId' | 'name'> = {}) {
+    this.session = { roomId, name, ...auth };
   }
 
   async connect(): Promise<void> {
@@ -70,6 +74,19 @@ export class SignalingClient {
     this.socket = null;
     this.emitState('closed');
     this.log('fechado pelo cliente');
+  }
+
+  private sendJoin() {
+    if (!this.session) return;
+    this.send({
+      type: 'join',
+      roomId: this.session.roomId,
+      name: this.session.name,
+      inviteToken: this.session.inviteToken,
+      pin: this.session.pin,
+      hostSecret: this.session.hostSecret,
+      resumeToken: this.session.resumeToken,
+    });
   }
 
   private openSocket(isReconnect: boolean): Promise<void> {
@@ -108,16 +125,15 @@ export class SignalingClient {
         this.reconnectAttempt = 0;
         this.emitState('open', { reconnected });
         this.log(reconnected ? 'WebSocket reconectado' : 'WebSocket conectado');
-        if (this.session) {
-          this.send({ type: 'join', roomId: this.session.roomId, name: this.session.name });
-          this.log(`join enviado para sala ${this.session.roomId}`);
-        }
+        this.sendJoin();
+        if (this.session) this.log(`join enviado para sala ${this.session.roomId}${this.session.resumeToken ? ' (resume)' : ''}`);
         resolve();
       }, { once: true });
 
       socket.addEventListener('message', (event) => {
         try {
           const message = JSON.parse(String(event.data)) as ServerMessage;
+          if (message.type === 'welcome' && this.session) this.session.resumeToken = message.sessionToken;
           for (const handler of this.handlers) handler(message);
         } catch (error) {
           this.log(`mensagem inválida: ${error instanceof Error ? error.message : String(error)}`);

@@ -1,6 +1,7 @@
 export type ParsedInvite = {
   serverUrl: string;
   roomId: string;
+  inviteToken: string;
 };
 
 export function normalizeRoom(value: string) {
@@ -13,12 +14,13 @@ export function createRoomCode() {
   return Array.from(bytes, (value) => alphabet[value % alphabet.length]).join('');
 }
 
-export function createInvite(serverUrl: string, roomId: string) {
+export function createInvite(serverUrl: string, roomId: string, inviteToken: string) {
   const url = new URL(serverUrl);
   url.pathname = '/join';
   url.search = '';
   url.hash = '';
   url.searchParams.set('room', normalizeRoom(roomId));
+  url.searchParams.set('token', inviteToken);
   return url.toString();
 }
 
@@ -35,20 +37,24 @@ export function parseInvite(raw: string): ParsedInvite {
 
   let serverUrl = '';
   let roomId = '';
+  let inviteToken = '';
 
   if (url.protocol === 'discordy:') {
     if (url.hostname !== 'join') throw new Error('Convite Discordy inválido.');
     serverUrl = url.searchParams.get('server') || '';
     roomId = url.searchParams.get('room') || '';
+    inviteToken = url.searchParams.get('token') || '';
   } else if (url.protocol === 'https:' || url.protocol === 'http:') {
     serverUrl = url.origin;
     roomId = url.searchParams.get('room') || '';
+    inviteToken = url.searchParams.get('token') || '';
   } else {
     throw new Error('O convite usa um protocolo não suportado.');
   }
 
   const room = normalizeRoom(roomId);
   if (!room) throw new Error('O convite não contém uma sala válida.');
+  if (!inviteToken || inviteToken.length < 12) throw new Error('Este convite foi invalidado ou pertence a uma versão antiga do Discordy.');
 
   let server: URL;
   try {
@@ -58,5 +64,5 @@ export function parseInvite(raw: string): ParsedInvite {
   }
   if (!['http:', 'https:', 'ws:', 'wss:'].includes(server.protocol)) throw new Error('Servidor do convite inválido.');
 
-  return { serverUrl: server.origin, roomId: room };
+  return { serverUrl: server.origin, roomId: room, inviteToken };
 }

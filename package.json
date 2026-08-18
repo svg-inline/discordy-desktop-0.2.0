@@ -1,9 +1,9 @@
 {
   "name": "discordy-desktop",
-  "version": "0.4.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
-  "description": "Discordy Desktop - Screen Share avançado com seletor de monitor/janela, qualidade, bitrate, FPS, fullscreen, PiP e múltiplas transmissões",
+  "description": "Discordy Desktop - Desktop Experience com tray, notificações nativas, atalhos globais, PTT em segundo plano, deep links e inicialização com Windows",
   "main": "electron/main.mjs",
   "author": "Discordy",
   "license": "UNLICENSED",
@@ -42,7 +42,8 @@
       "dist/**/*",
       "electron/**/*",
       "server/**/*",
-      "package.json"
+      "package.json",
+      "assets/**/*"
     ],
     "protocols": [
       {
@@ -67,6 +68,10 @@
     },
     "directories": {
       "output": "release"
-    }
+    },
+    "asarUnpack": [
+      "electron/global-key-monitor.ps1",
+      "assets/tray.png"
+    ]
   }
 }

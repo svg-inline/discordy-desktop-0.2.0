@@ -1,4 +1,76 @@
-# Teste remoto — Discordy Desktop 0.4.0
+# Teste remoto — Discordy Desktop 0.8.0
+
+## Desktop Experience — 0.8.0
+
+### 1. Tray e ciclo da janela
+
+1. Abra o Discordy.
+2. Minimize a janela.
+3. Com **Minimizar para bandeja** habilitado, a janela deve desaparecer da barra de tarefas e a chamada deve continuar.
+4. Clique no ícone do Discordy na bandeja: a janela deve voltar.
+5. Feche pelo `X`.
+6. Com **Fechar para bandeja** habilitado, o processo deve continuar ativo.
+7. Use **Encerrar Discordy** no menu da bandeja para finalizar de verdade.
+
+### 2. Notificações nativas
+
+1. Habilite **Notificações nativas**.
+2. Deixe o Discordy oculto/minimizado.
+3. Em outro cliente, envie uma mensagem P2P.
+4. A notificação deve mostrar remetente e trecho da mensagem.
+5. Repita entrando com outro participante e, no host, com aprovação manual ativada.
+6. Clique na notificação: a janela deve ser restaurada e focada.
+
+### 3. Atalhos globais
+
+Com Discordy minimizado:
+
+```text
+Ctrl+Shift+M       alterna mute
+Ctrl+Shift+D       alterna deafen
+Ctrl+Shift+Espaço  mostra/oculta a janela
+```
+
+Confirme visualmente no tray e, ao reabrir, nos controles da chamada.
+
+### 4. Push-to-Talk global
+
+1. Selecione **Push-to-Talk**.
+2. Minimize o Discordy.
+3. Mantenha `V` pressionado em outro aplicativo.
+4. O áudio deve ser transmitido apenas enquanto `V` estiver pressionado.
+5. Solte `V`: a transmissão deve fechar imediatamente.
+6. Com Push-to-Mute habilitado, faça o mesmo com `M` e confirme o comportamento inverso.
+
+### 5. Deep link
+
+Com Discordy fechado e depois com Discordy já aberto, teste um convite `discordy://join/...`.
+
+Esperado:
+
+- inicia/restaura a mesma instância;
+- traz a janela para frente;
+- preenche o convite e inicia o fluxo de entrada quando o nome estiver disponível.
+
+### 6. Iniciar com Windows
+
+No build empacotado/instalado:
+
+1. Habilite **Iniciar com o Windows**.
+2. Reinicie a sessão do Windows ou valide em **Aplicativos de Inicialização**.
+3. O Discordy deve iniciar com `--hidden`, disponível apenas na bandeja.
+4. Desabilite a opção e confirme a remoção do login item.
+
+### 7. Persistência
+
+1. Selecione microfone, saída e câmera diferentes.
+2. Troque tema/densidade e configurações de voz/tela.
+3. Altere nome e defaults de criação da sala.
+4. Feche completamente pelo menu da bandeja.
+5. Abra novamente.
+6. As opções devem ser restauradas; PIN da sala não deve ser persistido.
+
+---
 
 ## 1. Conexão inicial
 
@@ -326,3 +398,270 @@ Após os testes da 0.4.0, repetir:
 - ICE restart;
 - Network Diagnostics;
 - copiar relatório técnico.
+
+# TURN / Connectivity — 0.5.1
+
+## 22. Configuração STUN/TURN
+
+1. Abra **Diagnóstico WebRTC**.
+2. No bloco **STUN / TURN**, confirme os modos:
+   - `Automático — P2P → TURN`;
+   - `Somente P2P / STUN`;
+   - `Somente TURN / relay`.
+3. Informe uma URL STUN válida e salve.
+4. Confirme nos logs:
+
+```text
+[ICE] configuração aplicada
+```
+
+5. Reabra o aplicativo e confirme que a configuração salva permanece.
+
+## 23. Coturn / teste de TURN
+
+Com um Coturn funcional:
+
+1. Configure `turn:` ou `turns:`.
+2. Informe usuário e credencial quando exigidos.
+3. Clique em **Testar TURN**.
+4. O resultado deve ser **TURN operacional**.
+5. Confirme que o teste informa candidato `relay` e protocolo.
+6. Altere a senha para uma inválida e repita.
+7. O teste deve falhar sem derrubar a sala atual.
+
+## 24. P2P direto
+
+Preferencialmente em dois dispositivos na mesma rede/LAN:
+
+1. Selecione `p2p-only`.
+2. Conecte os dois clientes.
+3. Abra o diagnóstico.
+4. Quando o candidate pair selecionado for `host ↔ host`, o badge deve mostrar:
+
+```text
+P2P direto
+```
+
+## 25. P2P via NAT
+
+Em dispositivos/redes onde ICE usar `srflx` ou `prflx`:
+
+1. Use `auto` ou `p2p-only`.
+2. Conecte os peers.
+3. Confirme no diagnóstico:
+
+```text
+P2P via NAT
+```
+
+4. Confirme os candidate types exibidos.
+
+## 26. TURN obrigatório
+
+1. Configure Coturn válido.
+2. Selecione `turn-only`.
+3. Clique em **Salvar e aplicar**.
+4. Reconecte/aguarde ICE restart.
+5. O diagnóstico deve mostrar:
+
+```text
+TURN Relay
+```
+
+6. O candidate pair selecionado deve incluir `relay`.
+
+## 27. Fallback automático
+
+Este teste deve ser feito em uma rede onde a rota P2P seja bloqueada/restrita, ou com regras de firewall de laboratório.
+
+1. Configure `auto` com STUN + TURN válidos.
+2. Inicie a conexão.
+3. Deixe a tentativa P2P falhar.
+4. Confirme nos logs:
+
+```text
+fallback TURN ativado
+```
+
+5. Depois da recuperação, o diagnóstico deve mostrar `TURN Relay`.
+6. Áudio, câmera e screen share devem continuar funcionando após a troca de rota.
+
+## 28. Regressão 0.5.1
+
+Repetir:
+
+- mute/deafen;
+- câmera;
+- seleção de dispositivos;
+- Push-to-Talk/Push-to-Mute;
+- screen share 720p30/1080p30/1080p60;
+- múltiplas transmissões;
+- fullscreen/PiP;
+- Network Diagnostics;
+- reconexão WebSocket;
+- ICE restart;
+- relatório técnico.
+
+
+# Room Management — 0.6.0
+
+## 29. Nome, host e limite
+
+1. Crie uma sala com nome personalizado.
+2. Escolha limite `2`, `3` e `4` em testes separados.
+3. Confirme o nome no header, sidebar e convite web.
+4. Confirme o badge `HOST` na lista de participantes.
+5. Tente reduzir o limite para menos participantes do que já existem e confirme rejeição do servidor.
+
+## 30. Bloquear/desbloquear entrada
+
+1. Com o host conectado, abra **Gerenciar sala**.
+2. Clique em **Bloquear**.
+3. Tente entrar usando um convite ainda válido em outro PC.
+4. Confirmar mensagem de sala bloqueada.
+5. Clique em **Desbloquear** e repita a entrada.
+
+## 31. Expulsar participante
+
+1. Entre com um convidado.
+2. No host, clique em **Expulsar** no participante.
+3. O convidado deve receber a mensagem de remoção e voltar à tela inicial.
+4. O participante deve desaparecer da lista e o `peer-left` deve remover a conexão WebRTC.
+
+## 32. Regenerar e invalidar convite
+
+1. Copie o convite A.
+2. Clique em **Gerar novo convite** e copie o convite B.
+3. Confirme que A não entra mais.
+4. Confirme que B entra.
+5. Clique em **Invalidar convite**.
+6. Confirme que B também deixa de aceitar novas entradas.
+7. Confirme que participantes já conectados permanecem na sala.
+
+## 33. PIN opcional
+
+1. Crie uma sala com PIN de 4–12 números.
+2. Tente entrar sem PIN: deve receber `PIN_REQUIRED`.
+3. Tente PIN incorreto: deve receber `INVALID_PIN`.
+4. Informe o PIN correto e confirme entrada.
+5. No host, remova o PIN em **Gerenciar sala** e confirme entrada posterior sem PIN.
+
+## 34. Confirmação manual de entrada
+
+1. Crie a sala com **Confirmar cada entrada manualmente**.
+2. Convidado tenta entrar e deve ver **Aguardando aprovação**.
+3. Host deve ver a solicitação na sidebar.
+4. Clique em **Recusar** e confirme retorno do convidado com mensagem.
+5. Repita e clique em **Aceitar**.
+6. Confirme que o convidado entra sem precisar reconectar manualmente.
+7. Deixe uma solicitação sem resposta por 30 segundos e confirme expiração.
+
+## 35. Presença e resume token
+
+1. Com dois PCs conectados, corte a rede do convidado.
+2. No host, a presença deve mudar para `Reconectando`.
+3. Após aproximadamente 8 segundos, deve mudar para `Desconectado`.
+4. Reative a rede antes de aproximadamente 38 segundos.
+5. O convidado deve retomar o mesmo `peerId` e voltar a `Online`.
+6. Repita deixando a janela de recuperação expirar.
+7. Confirme `peer-left` e remoção definitiva da lista.
+
+## 36. Regressão geral
+
+Após Room Management, repetir:
+
+- áudio e câmera;
+- screen share múltiplo;
+- Network Diagnostics;
+- fallback TURN;
+- Perfect Negotiation;
+- ICE restart;
+- layout em janela pequena.
+
+# Chat P2P — 0.7.0
+
+## 37. RTCDataChannel
+
+1. Conecte dois PCs na mesma sala.
+2. Abra **Chat** nos dois clientes.
+3. Aguarde o indicador mostrar `P2P conectado · 1/1`.
+4. Confirme nos logs:
+
+```text
+RTCDataChannel de chat criado
+RTCDataChannel chat aberto
+```
+
+5. Envie uma mensagem de A para B e outra de B para A.
+6. Confirme que o signaling server não registra conteúdo de chat.
+
+## 38. Mensagens e links
+
+1. Envie texto simples.
+2. Envie uma mensagem com múltiplas linhas usando `Shift+Enter`.
+3. Envie:
+
+```text
+https://example.com
+```
+
+4. Confirme que o link fica clicável.
+5. Clique no link e confirme abertura no navegador padrão, não em uma nova janela Electron.
+6. Teste também um link `http://`.
+
+## 39. Copiar mensagem
+
+1. Passe o mouse sobre uma mensagem.
+2. Clique em **Copiar**.
+3. Cole em um editor de texto.
+4. Confirme que apenas o conteúdo textual da mensagem foi copiado.
+
+## 40. Indicador digitando
+
+1. Abra o chat nos dois PCs.
+2. Em A, comece a digitar sem enviar.
+3. B deve mostrar `A está digitando...`.
+4. Pare de digitar por aproximadamente 1,4 segundo.
+5. O indicador deve desaparecer.
+6. Feche/desconecte A enquanto digita e confirme que o indicador não fica preso em B.
+
+## 41. Badge de não lidas
+
+1. Feche o painel Chat em B.
+2. Envie 3 mensagens por A.
+3. Confirme badge `3` no botão Chat de B.
+4. Abra o painel.
+5. O badge deve zerar.
+
+## 42. Histórico somente da sessão
+
+1. Troque mensagens entre A e B.
+2. Provoque uma reconexão temporária do signaling.
+3. Confirme que o histórico local permanece.
+4. Saia normalmente da sala.
+5. Entre novamente.
+6. Confirme que o histórico anterior não reaparece.
+
+## 43. Três ou quatro participantes
+
+1. Conecte pelo menos 3 clientes.
+2. Aguarde o painel indicar todos os DataChannels disponíveis.
+3. A envia uma mensagem.
+4. Confirme recebimento direto em B e C.
+5. Faça C responder e confirme recebimento em A e B.
+6. Desconecte B e continue trocando mensagens entre A e C.
+
+## 44. Regressão
+
+Após validar o Chat P2P, repetir:
+
+- áudio e mute/deafen;
+- câmera;
+- compartilhamento de tela;
+- múltiplas transmissões;
+- Room Management;
+- reconexão WebSocket/WebRTC;
+- ICE restart;
+- TURN fallback;
+- Network Diagnostics.
+
