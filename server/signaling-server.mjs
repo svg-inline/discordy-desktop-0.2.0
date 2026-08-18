@@ -153,10 +153,25 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, maxPa
   });
 
   wss.on('connection', (ws) => {
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
     ws.on('message', (raw) => handleMessage(ws, raw));
     ws.on('close', () => leave(ws));
     ws.on('error', (error) => logger(`[ws] ${error.message}`));
   });
+
+  const heartbeat = setInterval(() => {
+    for (const ws of wss.clients) {
+      if (ws.isAlive === false) {
+        logger('[ws] conexão sem heartbeat; encerrando');
+        ws.terminate();
+        continue;
+      }
+      ws.isAlive = false;
+      try { ws.ping(); } catch { /* socket closing */ }
+    }
+  }, 20000);
+  heartbeat.unref?.();
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -173,6 +188,7 @@ export async function startSignalingServer({ host = '127.0.0.1', port = 0, maxPa
     port: address.port,
     baseUrl: `http://${host}:${address.port}`,
     async close() {
+      clearInterval(heartbeat);
       for (const ws of clients.keys()) {
         try { ws.close(); } catch { /* noop */ }
       }

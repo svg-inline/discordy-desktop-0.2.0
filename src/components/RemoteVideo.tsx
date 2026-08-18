@@ -23,7 +23,8 @@ export function RemoteVideo({ peer }: Props) {
     return () => peer.stream.removeEventListener('addtrack', play);
   }, [peer.stream]);
 
-  const hasVideo = peer.stream.getVideoTracks().some((track) => track.readyState === 'live');
+  const hasLiveVideoTrack = peer.stream.getVideoTracks().some((track) => track.readyState === 'live');
+  const hasVideo = hasLiveVideoTrack && (peer.media.screen || peer.media.camera);
 
   return (
     <article className={`media-tile media-tile--remote ${hasVideo ? 'has-video' : ''}`}>
@@ -35,7 +36,7 @@ export function RemoteVideo({ peer }: Props) {
           </div>
         )}
         <div className="media-tile__status">
-          <span>{peer.name}</span>
+          <span>{peer.name}{peer.media.screen ? <small> · compartilhando tela</small> : null}</span>
           <span className={`connection-badge connection-badge--${peer.connectionState}`}>{peer.connectionState}</span>
         </div>
       </div>

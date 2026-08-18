@@ -3,9 +3,12 @@ export type PeerInfo = {
   name: string;
 };
 
+export type MediaSource = 'microphone' | 'camera' | 'screen';
+
 export type SignalPayload =
   | { description: RTCSessionDescriptionInit }
-  | { candidate: RTCIceCandidateInit };
+  | { candidate: RTCIceCandidateInit }
+  | { media: { source: MediaSource; active: boolean } };
 
 export type ClientMessage =
   | { type: 'join'; roomId: string; name: string }
@@ -22,4 +25,5 @@ export type ServerMessage =
 export type RemotePeer = PeerInfo & {
   stream: MediaStream;
   connectionState: RTCPeerConnectionState;
+  media: Record<MediaSource, boolean>;
 };

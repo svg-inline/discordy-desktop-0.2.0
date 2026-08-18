@@ -2,18 +2,14 @@ import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { RemoteVideo } from './components/RemoteVideo';
 import { createInvite, createRoomCode, parseInvite } from './lib/invite';
 import { SignalingClient } from './lib/signaling';
-import type { PeerInfo, RemotePeer, ServerMessage, SignalPayload } from './lib/types';
+import type { SignalingState } from './lib/signaling';
+import { PeerManager } from './rtc/PeerManager';
+import type { PeerDiagnostics } from './rtc/diagnostics';
+import type { RemotePeer, ServerMessage } from './lib/types';
 
 const DEFAULT_STUN = typeof import.meta.env.VITE_STUN_URL === 'string' ? import.meta.env.VITE_STUN_URL : 'stun:stun.l.google.com:19302';
 const MAX_PARTICIPANTS = 4;
-
-type PeerConnectionState = {
-  info: PeerInfo;
-  pc: RTCPeerConnection;
-  remoteStream: MediaStream;
-  pendingCandidates: RTCIceCandidateInit[];
-  screenSenders: RTCRtpSender[];
-};
+const APP_VERSION = '0.2.3';
 
 type HomeMode = 'home' | 'host' | 'join';
 type ThemeMode = 'dark' | 'onyx';
@@ -39,6 +35,7 @@ type IconName =
   | 'users'
   | 'settings'
   | 'logs'
+  | 'activity'
   | 'chevron'
   | 'arrow';
 
@@ -56,6 +53,7 @@ const ICON_PATHS: Record<IconName, string[]> = {
   users: ['M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2', 'M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z', 'M22 21v-2a4 4 0 0 0-3-3.87', 'M16 3.13a4 4 0 0 1 0 7.75'],
   settings: ['M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z', 'M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-2.12 2.12-.06-.06a1.7 1.7 0 0 0-1.88-.34 1.7 1.7 0 0 0-1.03 1.55V20.3h-3v-.09a1.7 1.7 0 0 0-1.03-1.55 1.7 1.7 0 0 0-1.88.34l-.06.06-2.12-2.12.06-.06A1.7 1.7 0 0 0 7 15a1.7 1.7 0 0 0-1.55-1.03H5.3v-3h.15A1.7 1.7 0 0 0 7 9.94a1.7 1.7 0 0 0-.34-1.88L6.6 8l2.12-2.12.06.06a1.7 1.7 0 0 0 1.88.34A1.7 1.7 0 0 0 11.7 4.7v-.1h3v.1a1.7 1.7 0 0 0 1.03 1.55 1.7 1.7 0 0 0 1.88-.34l.06-.06L19.8 8l-.06.06a1.7 1.7 0 0 0-.34 1.88 1.7 1.7 0 0 0 1.55 1.03h.15v3h-.15A1.7 1.7 0 0 0 19.4 15Z'],
   logs: ['M4 4h16v16H4z', 'M8 9h8', 'M8 13h8', 'M8 17h5'],
+  activity: ['M3 12h4l2.2-6 4.1 12 2.5-7H21'],
   chevron: ['m9 18 6-6-6-6'],
   arrow: ['M5 12h14', 'm13 6 6 6-6 6'],
 };
@@ -70,6 +68,30 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
 
 function initialFor(value: string) {
   return value.trim().charAt(0).toUpperCase() || 'D';
+}
+
+function formatMetric(value: number | null, unit = '', digits = 1) {
+  if (value === null || !Number.isFinite(value)) return '—';
+  return `${value.toFixed(digits)}${unit}`;
+}
+
+function formatBitrate(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return '—';
+  if (value >= 1000) return `${(value / 1000).toFixed(2)} Mbps`;
+  return `${value.toFixed(1)} Kbps`;
+}
+
+function routeLabel(route: PeerDiagnostics['route']) {
+  if (route === 'turn') return 'TURN Relay';
+  if (route === 'p2p') return 'P2P direto';
+  return 'Indeterminado';
+}
+
+function videoLabel(video: PeerDiagnostics['receivedVideo']) {
+  if (!video) return '—';
+  const size = video.width && video.height ? `${video.width}×${video.height}` : 'resolução n/d';
+  const fps = video.fps !== null ? `${video.fps.toFixed(1)} FPS` : 'FPS n/d';
+  return `${size} · ${fps}`;
 }
 
 function App() {
@@ -92,133 +114,94 @@ function App() {
   const [cloudflared, setCloudflared] = useState<{ installed: boolean; version: string | null } | null>(null);
   const [technicalLogs, setTechnicalLogs] = useState<string[]>([]);
   const [showLogs, setShowLogs] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [networkDiagnostics, setNetworkDiagnostics] = useState<PeerDiagnostics[]>([]);
+  const [networkTesting, setNetworkTesting] = useState(false);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  const [diagnosticsUpdatedAt, setDiagnosticsUpdatedAt] = useState<Date | null>(null);
 
   const signalingRef = useRef<SignalingClient | null>(null);
-  const peersRef = useRef(new Map<string, PeerConnectionState>());
+  const peerManagerRef = useRef<PeerManager | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const screenStreamRef = useRef<MediaStream | null>(null);
   const localPreviewRef = useRef<HTMLVideoElement | null>(null);
+  const selfIdRef = useRef<string | null>(null);
+  const roomIdRef = useRef<string | null>(null);
 
-  const refreshPeers = useCallback(() => {
-    setRemotePeers(Array.from(peersRef.current.values()).map((peer) => ({
-      ...peer.info,
-      stream: peer.remoteStream,
-      connectionState: peer.pc.connectionState,
-    })));
+  const appendTechnicalLog = useCallback((line: string) => {
+    const timestamp = new Date().toLocaleTimeString('pt-BR', { hour12: false });
+    setTechnicalLogs((logs) => [...logs.slice(-399), `[${timestamp}] ${line}`]);
   }, []);
 
-  const sendSignal = useCallback((target: string, data: SignalPayload) => {
-    signalingRef.current?.send({ type: 'signal', target, data });
-  }, []);
-
-  const addCurrentLocalTracks = useCallback((state: PeerConnectionState) => {
-    const micStream = micStreamRef.current;
-    if (micStream) {
-      for (const track of micStream.getTracks()) {
-        if (!state.pc.getSenders().some((sender) => sender.track === track)) state.pc.addTrack(track, micStream);
-      }
-    }
-
-    const currentScreen = screenStreamRef.current;
-    if (currentScreen && state.screenSenders.length === 0) {
-      state.screenSenders = currentScreen.getTracks().map((track) => state.pc.addTrack(track, currentScreen));
-    }
-  }, []);
-
-  const negotiate = useCallback(async (peerId: string) => {
-    const state = peersRef.current.get(peerId);
-    if (!state || state.pc.signalingState !== 'stable') return;
-    try {
-      const offer = await state.pc.createOffer();
-      await state.pc.setLocalDescription(offer);
-      sendSignal(peerId, { description: state.pc.localDescription! });
-    } catch (cause) {
-      console.error('Falha ao negociar peer:', cause);
-    }
-  }, [sendSignal]);
-
-  const createPeer = useCallback((info: PeerInfo) => {
-    const existing = peersRef.current.get(info.peerId);
-    if (existing) return existing;
-
-    const pc = new RTCPeerConnection({ iceServers: [{ urls: DEFAULT_STUN }] });
-    const state: PeerConnectionState = {
-      info,
-      pc,
-      remoteStream: new MediaStream(),
-      pendingCandidates: [],
-      screenSenders: [],
-    };
-
-    peersRef.current.set(info.peerId, state);
-    addCurrentLocalTracks(state);
-
-    pc.onicecandidate = (event) => {
-      if (event.candidate) sendSignal(info.peerId, { candidate: event.candidate.toJSON() });
-    };
-    pc.ontrack = (event) => {
-      if (!state.remoteStream.getTracks().some((track) => track.id === event.track.id)) state.remoteStream.addTrack(event.track);
-      event.track.addEventListener('ended', () => {
-        state.remoteStream.removeTrack(event.track);
-        refreshPeers();
-      });
-      refreshPeers();
-    };
-    pc.onconnectionstatechange = refreshPeers;
-    refreshPeers();
-    return state;
-  }, [addCurrentLocalTracks, refreshPeers, sendSignal]);
-
-  const flushCandidates = useCallback(async (state: PeerConnectionState) => {
-    if (!state.pc.remoteDescription) return;
-    for (const candidate of state.pendingCandidates.splice(0)) await state.pc.addIceCandidate(candidate);
-  }, []);
-
-  const handleSignal = useCallback(async (from: string, data: SignalPayload) => {
-    let state = peersRef.current.get(from);
-    if (!state) state = createPeer({ peerId: from, name: `Peer ${from.slice(0, 5)}` });
-
-    try {
-      if ('description' in data) {
-        const description = data.description;
-        if (description.type === 'offer' && state.pc.signalingState !== 'stable') return;
-        await state.pc.setRemoteDescription(description);
-        await flushCandidates(state);
-        if (description.type === 'offer') {
-          const answer = await state.pc.createAnswer();
-          await state.pc.setLocalDescription(answer);
-          sendSignal(from, { description: state.pc.localDescription! });
-        }
-        return;
-      }
-
-      if (state.pc.remoteDescription) await state.pc.addIceCandidate(data.candidate);
-      else state.pendingCandidates.push(data.candidate);
-    } catch (cause) {
-      console.error('Erro processando sinal WebRTC:', cause);
-      setError('Falha na negociação WebRTC. Abra os detalhes técnicos para diagnóstico.');
-    }
-  }, [createPeer, flushCandidates, sendSignal]);
+  if (!peerManagerRef.current) {
+    peerManagerRef.current = new PeerManager({
+      iceServers: [{ urls: DEFAULT_STUN }],
+      sendSignal: (target, data) => signalingRef.current?.send({ type: 'signal', target, data }) ?? false,
+      onPeersChanged: setRemotePeers,
+      onLog: appendTechnicalLog,
+    });
+  }
 
   const handleServerMessage = useCallback(async (message: ServerMessage) => {
-    if (message.type === 'error') return setError(message.message);
+    const peerManager = peerManagerRef.current!;
+
+    if (message.type === 'error') {
+      appendTechnicalLog(`[SERVER] ${message.message}`);
+      setError(message.message);
+      return;
+    }
+
     if (message.type === 'welcome') {
+      const isReconnect = Boolean(selfIdRef.current && selfIdRef.current !== message.peerId);
+      if (isReconnect) {
+        appendTechnicalLog(`[RTC] sessão de signaling renovada; reconstruindo ${message.peers.length} peer(s)`);
+        peerManager.resetPeers('signaling-reconnect');
+      }
+
+      selfIdRef.current = message.peerId;
+      roomIdRef.current = message.roomId;
+      peerManager.setLocalPeerId(message.peerId);
       setSelfId(message.peerId);
       setRoomId(message.roomId);
-      setStatus('Conectado');
-      for (const peer of message.peers) createPeer(peer);
-      for (const peer of message.peers) await negotiate(peer.peerId);
+      setStatus(isReconnect ? 'Reconectado' : 'Conectado');
+      setError(null);
+
+      for (const peer of message.peers) peerManager.createPeer(peer);
+      appendTechnicalLog(`[SERVER] welcome ${message.peerId.slice(0, 8)} em ${message.roomId}; peers=${message.peers.length}`);
       return;
     }
-    if (message.type === 'peer-joined') return void createPeer(message.peer);
+
+    if (message.type === 'peer-joined') {
+      peerManager.createPeer(message.peer);
+      appendTechnicalLog(`[SERVER] ${message.peer.name} entrou (${message.peer.peerId.slice(0, 8)})`);
+      return;
+    }
+
     if (message.type === 'peer-left') {
-      peersRef.current.get(message.peerId)?.pc.close();
-      peersRef.current.delete(message.peerId);
-      refreshPeers();
+      peerManager.removePeer(message.peerId, 'peer-left');
       return;
     }
-    if (message.type === 'signal') await handleSignal(message.from, message.data);
-  }, [createPeer, handleSignal, negotiate, refreshPeers]);
+
+    if (message.type === 'signal') {
+      try {
+        await peerManager.handleSignal(message.from, message.data);
+      } catch (cause) {
+        const detail = cause instanceof Error ? cause.message : String(cause);
+        appendTechnicalLog(`[RTC ${message.from.slice(0, 8)}] erro processando signaling: ${detail}`);
+        setError('Falha na negociação WebRTC. Abra os detalhes técnicos para diagnóstico.');
+      }
+    }
+  }, [appendTechnicalLog]);
+
+  const handleSignalingState = useCallback((next: SignalingState, details?: { attempt?: number; delayMs?: number; reconnected?: boolean }) => {
+    if (next === 'connecting') setStatus('Conectando signaling...');
+    if (next === 'open') setStatus(details?.reconnected ? 'Reentrando na sala...' : 'Signaling conectado');
+    if (next === 'reconnecting') {
+      const suffix = details?.delayMs ? ` em ${Math.ceil(details.delayMs / 1000)}s` : '';
+      setStatus(`Reconectando signaling${suffix}`);
+    }
+    if (next === 'closed' && roomIdRef.current) setStatus('Signaling encerrado');
+  }, []);
 
   const ensureMicrophone = useCallback(async () => {
     if (micStreamRef.current) return micStreamRef.current;
@@ -228,13 +211,18 @@ function App() {
         video: false,
       });
       micStreamRef.current = stream;
+      for (const track of stream.getAudioTracks()) track.enabled = micEnabled;
+      peerManagerRef.current?.setMicrophone(stream);
+      peerManagerRef.current?.setMicrophoneEnabled(micEnabled);
+      appendTechnicalLog(`[MEDIA] microphone=${stream.getAudioTracks()[0]?.id.slice(0, 8) || 'none'}`);
       return stream;
     } catch (cause) {
-      console.warn('Microfone indisponível:', cause);
+      appendTechnicalLog(`[MEDIA] microfone indisponível: ${cause instanceof Error ? cause.message : String(cause)}`);
       setMicEnabled(false);
+      peerManagerRef.current?.setMicrophone(null);
       return null;
     }
-  }, []);
+  }, [appendTechnicalLog, micEnabled]);
 
   const connectToRoom = useCallback(async (targetServer: string, targetRoom: string, requestedName: string) => {
     const cleanName = requestedName.trim().slice(0, 40);
@@ -245,13 +233,22 @@ function App() {
     setStatus('Conectando...');
     await ensureMicrophone();
 
-    const signaling = new SignalingClient(targetServer);
+    signalingRef.current?.close();
+    const signaling = new SignalingClient(targetServer, appendTechnicalLog);
     signalingRef.current = signaling;
+    signaling.setSession(targetRoom, cleanName);
     signaling.onMessage((message) => void handleServerMessage(message));
-    await signaling.connect();
-    signaling.send({ type: 'join', roomId: targetRoom, name: cleanName });
-    setServerUrl(targetServer);
-  }, [ensureMicrophone, handleServerMessage]);
+    signaling.onStateChange(handleSignalingState);
+
+    try {
+      await signaling.connect();
+      setServerUrl(targetServer);
+    } catch (cause) {
+      signaling.close();
+      if (signalingRef.current === signaling) signalingRef.current = null;
+      throw cause;
+    }
+  }, [appendTechnicalLog, ensureMicrophone, handleServerMessage, handleSignalingState]);
 
   const checkCloudflared = useCallback(async () => {
     const result = await window.discordy.cloudflared.check();
@@ -305,12 +302,15 @@ function App() {
   const leave = useCallback(async () => {
     signalingRef.current?.close();
     signalingRef.current = null;
-    for (const state of peersRef.current.values()) state.pc.close();
-    peersRef.current.clear();
+    peerManagerRef.current?.reset();
+
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     micStreamRef.current = null;
     screenStreamRef.current?.getTracks().forEach((track) => track.stop());
     screenStreamRef.current = null;
+    selfIdRef.current = null;
+    roomIdRef.current = null;
+
     setScreenStream(null);
     setRemotePeers([]);
     setRoomId(null);
@@ -318,6 +318,10 @@ function App() {
     setServerUrl(null);
     setStatus('Pronto');
     setShowLogs(false);
+    setShowDiagnostics(false);
+    setNetworkDiagnostics([]);
+    setDiagnosticsError(null);
+    setDiagnosticsUpdatedAt(null);
 
     if (isHosting) await window.discordy.host.stop().catch(() => undefined);
     setIsHosting(false);
@@ -328,35 +332,34 @@ function App() {
   const toggleMic = () => {
     const next = !micEnabled;
     setMicEnabled(next);
-    for (const track of micStreamRef.current?.getAudioTracks() || []) track.enabled = next;
+    peerManagerRef.current?.setMicrophoneEnabled(next);
   };
 
   const stopScreenShare = useCallback(async () => {
     const stream = screenStreamRef.current;
     if (!stream) return;
     screenStreamRef.current = null;
+    peerManagerRef.current?.setScreen(null);
     setScreenStream(null);
     for (const track of stream.getTracks()) track.stop();
-    for (const state of peersRef.current.values()) {
-      for (const sender of state.screenSenders) {
-        try { state.pc.removeTrack(sender); } catch { /* closed peer */ }
-      }
-      state.screenSenders = [];
-    }
-    for (const peerId of peersRef.current.keys()) await negotiate(peerId);
-  }, [negotiate]);
+    appendTechnicalLog('[MEDIA] compartilhamento local encerrado');
+  }, [appendTechnicalLog]);
 
   const startScreenShare = async () => {
     if (screenStreamRef.current) return;
     try {
-      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30, max: 60 } }, audio: true });
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30, max: 60 } },
+        audio: true,
+      });
       screenStreamRef.current = stream;
+      peerManagerRef.current?.setScreen(stream);
       setScreenStream(stream);
-      for (const state of peersRef.current.values()) state.screenSenders = stream.getTracks().map((track) => state.pc.addTrack(track, stream));
-      stream.getVideoTracks()[0]?.addEventListener('ended', () => void stopScreenShare(), { once: true });
-      for (const peerId of peersRef.current.keys()) await negotiate(peerId);
+      const videoTrack = stream.getVideoTracks()[0];
+      appendTechnicalLog(`[MEDIA] screen video=${videoTrack?.id.slice(0, 8) || 'none'} audio=${stream.getAudioTracks()[0]?.id.slice(0, 8) || 'none'}`);
+      videoTrack?.addEventListener('ended', () => void stopScreenShare(), { once: true });
     } catch (cause) {
-      console.warn('Compartilhamento cancelado/indisponível:', cause);
+      appendTechnicalLog(`[MEDIA] compartilhamento cancelado/indisponível: ${cause instanceof Error ? cause.message : String(cause)}`);
     }
   };
 
@@ -365,6 +368,88 @@ function App() {
     await window.discordy.clipboard.writeText(hostState.invite);
     setStatus('Convite copiado');
   };
+
+  const refreshDiagnostics = useCallback(async () => {
+    if (!peerManagerRef.current) return [];
+    try {
+      const diagnostics = await peerManagerRef.current.getDiagnostics();
+      setNetworkDiagnostics(diagnostics);
+      setDiagnosticsUpdatedAt(new Date());
+      setDiagnosticsError(null);
+      return diagnostics;
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setDiagnosticsError(message);
+      appendTechnicalLog(`[DIAG] falha coletando métricas: ${message}`);
+      return [];
+    }
+  }, [appendTechnicalLog]);
+
+  const testConnections = useCallback(async () => {
+    if (!peerManagerRef.current || networkTesting) return;
+    setNetworkTesting(true);
+    setDiagnosticsError(null);
+    appendTechnicalLog('[DIAG] teste de conexão solicitado pelo usuário');
+    try {
+      const diagnostics = await peerManagerRef.current.testConnections();
+      setNetworkDiagnostics(diagnostics);
+      setDiagnosticsUpdatedAt(new Date());
+      if (diagnostics.length === 0) setDiagnosticsError('Nenhum peer remoto conectado para testar.');
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setDiagnosticsError(message);
+      appendTechnicalLog(`[DIAG] teste falhou: ${message}`);
+    } finally {
+      setNetworkTesting(false);
+    }
+  }, [appendTechnicalLog, networkTesting]);
+
+  const buildTechnicalReport = useCallback((diagnostics: PeerDiagnostics[]) => {
+    const lines = [
+      `Discordy ${APP_VERSION} — Relatório de rede`,
+      `Gerado em: ${new Date().toISOString()}`,
+      `Sala: ${roomIdRef.current ?? 'n/d'}`,
+      `Peer local: ${selfIdRef.current ?? 'n/d'}`,
+      `Servidor: ${serverUrl ?? 'n/d'}`,
+      `Modo: ${isHosting ? 'host' : 'convidado'}`,
+      `Status: ${status}`,
+      `Peers remotos: ${diagnostics.length}`,
+      '',
+    ];
+
+    for (const peer of diagnostics) {
+      lines.push(
+        `Peer: ${peer.name} (${peer.peerId})`,
+        `  Rota: ${routeLabel(peer.route)}`,
+        `  ICE candidates: ${peer.localCandidateType} ↔ ${peer.remoteCandidateType}`,
+        `  Transporte: ${peer.candidateProtocol}${peer.relayProtocol ? ` / relay=${peer.relayProtocol}` : ''}`,
+        `  Connection: ${peer.connectionState}`,
+        `  ICE: ${peer.iceConnectionState} / gathering=${peer.iceGatheringState}`,
+        `  Signaling: ${peer.signalingState}`,
+        `  RTT: ${formatMetric(peer.rttMs, ' ms')}`,
+        `  Jitter: ${formatMetric(peer.jitterMs, ' ms')}`,
+        `  Packet loss: ${formatMetric(peer.packetLossPct, '%', 2)} (${peer.packetsLost}/${peer.packetsReceived + peer.packetsLost})`,
+        `  Upload: ${formatBitrate(peer.bitrateUpKbps)}`,
+        `  Download: ${formatBitrate(peer.bitrateDownKbps)}`,
+        `  Codecs TX: ${peer.outboundCodecs.join(', ') || 'n/d'}`,
+        `  Codecs RX: ${peer.inboundCodecs.join(', ') || 'n/d'}`,
+        `  Vídeo RX: ${videoLabel(peer.receivedVideo)}`,
+        '',
+      );
+    }
+
+    lines.push('User-Agent:', navigator.userAgent, '', 'Logs recentes:');
+    lines.push(...(technicalLogs.length ? technicalLogs.slice(-80) : ['Sem logs técnicos.']));
+    return lines.join('\n');
+  }, [isHosting, serverUrl, status, technicalLogs]);
+
+  const copyTechnicalReport = useCallback(async () => {
+    const diagnostics = networkDiagnostics.length > 0 ? networkDiagnostics : await refreshDiagnostics();
+    const report = buildTechnicalReport(diagnostics);
+    await window.discordy.clipboard.writeText(report);
+    setStatus('Relatório técnico copiado');
+    appendTechnicalLog(`[DIAG] relatório técnico copiado (${diagnostics.length} peer(s))`);
+  }, [appendTechnicalLog, buildTechnicalReport, networkDiagnostics, refreshDiagnostics]);
 
   const updateTheme = (next: ThemeMode) => {
     setTheme(next);
@@ -381,8 +466,15 @@ function App() {
   }, [screenStream]);
 
   useEffect(() => {
+    if (!showDiagnostics || !roomId || networkTesting) return undefined;
+    void refreshDiagnostics();
+    const timer = window.setInterval(() => void refreshDiagnostics(), 2000);
+    return () => window.clearInterval(timer);
+  }, [networkTesting, refreshDiagnostics, roomId, showDiagnostics]);
+
+  useEffect(() => {
     const unsubscribeStatus = window.discordy.host.onStatus((next) => setStatus(next.message));
-    const unsubscribeLog = window.discordy.host.onLog((line) => setTechnicalLogs((logs) => [...logs.slice(-199), line]));
+    const unsubscribeLog = window.discordy.host.onLog((line) => appendTechnicalLog(`[HOST] ${line}`));
     const unsubscribeDeepLink = window.discordy.onDeepLink((url) => {
       setInviteInput(url);
       setMode('join');
@@ -396,11 +488,11 @@ function App() {
     };
     // Deep-link auto join intentionally tracks the current identity/session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [checkCloudflared, name, roomId]);
+  }, [appendTechnicalLog, checkCloudflared, name, roomId]);
 
   useEffect(() => () => {
     signalingRef.current?.close();
-    for (const state of peersRef.current.values()) state.pc.close();
+    peerManagerRef.current?.reset();
     micStreamRef.current?.getTracks().forEach((track) => track.stop());
     screenStreamRef.current?.getTracks().forEach((track) => track.stop());
   }, []);
@@ -466,7 +558,10 @@ function App() {
               <section className="voice-status-panel">
                 <div className="voice-status-row">
                   <div><span className="connection-dot" /><strong>Voz conectada</strong><small>WebRTC P2P · {status}</small></div>
-                  {isHosting && <button className={`icon-button icon-button--small ${showLogs ? 'is-active' : ''}`} title="Detalhes técnicos" onClick={() => setShowLogs((value) => !value)}><Icon name="logs" size={16} /></button>}
+                  <div className="voice-status-tools">
+                    <button className={`icon-button icon-button--small ${showDiagnostics ? 'is-active' : ''}`} title="Diagnóstico de rede" onClick={() => { setShowDiagnostics((value) => !value); setShowLogs(false); }}><Icon name="activity" size={16} /></button>
+                    <button className={`icon-button icon-button--small ${showLogs ? 'is-active' : ''}`} title="Logs técnicos" onClick={() => { setShowLogs((value) => !value); setShowDiagnostics(false); }}><Icon name="logs" size={16} /></button>
+                  </div>
                 </div>
                 <div className="voice-status-actions">
                   <button className="mini-action" onClick={() => void (screenStream ? stopScreenShare() : startScreenShare())}><Icon name="screen" size={15} />{screenStream ? 'Parar tela' : 'Tela'}</button>
@@ -501,7 +596,50 @@ function App() {
             <div className="stage-content">
               {error && <div className="alert alert--stage">{error}</div>}
 
-              {showLogs && isHosting && (
+              {showDiagnostics && (
+                <section className="network-drawer">
+                  <div className="network-drawer__header">
+                    <div><strong>Diagnóstico WebRTC</strong><span>{diagnosticsUpdatedAt ? `Atualizado ${diagnosticsUpdatedAt.toLocaleTimeString('pt-BR', { hour12: false })}` : 'Coletando métricas...'}</span></div>
+                    <div className="network-drawer__actions">
+                      <button className="button button--compact" disabled={networkTesting} onClick={() => void testConnections()}>{networkTesting ? 'Testando...' : 'Testar conexão'}</button>
+                      <button className="button button--compact" onClick={() => void copyTechnicalReport()}><Icon name="copy" size={14} />Copiar relatório</button>
+                      <button className="text-button" onClick={() => setShowDiagnostics(false)}>Fechar</button>
+                    </div>
+                  </div>
+                  <div className="network-drawer__body">
+                    {diagnosticsError && <div className="network-empty network-empty--error">{diagnosticsError}</div>}
+                    {!diagnosticsError && networkDiagnostics.length === 0 && <div className="network-empty">Nenhum peer remoto conectado. O diagnóstico passa a coletar dados quando outro participante entra.</div>}
+                    {networkDiagnostics.map((peer) => (
+                      <article className="network-peer" key={peer.peerId}>
+                        <header className="network-peer__header">
+                          <div><span className="avatar avatar--xs avatar--remote">{initialFor(peer.name)}</span><div><strong>{peer.name}</strong><span>{peer.peerId.slice(0, 8)}</span></div></div>
+                          <span className={`route-badge route-badge--${peer.route}`}>{routeLabel(peer.route)}</span>
+                        </header>
+                        <div className="network-route">
+                          <span><small>ICE selecionado</small><strong>{peer.localCandidateType} ↔ {peer.remoteCandidateType}</strong></span>
+                          <span><small>Protocolo</small><strong>{peer.candidateProtocol}{peer.relayProtocol ? ` / ${peer.relayProtocol}` : ''}</strong></span>
+                          <span><small>Estado ICE</small><strong>{peer.iceConnectionState}</strong></span>
+                          <span><small>Connection</small><strong>{peer.connectionState}</strong></span>
+                        </div>
+                        <div className="network-metrics">
+                          <span><small>RTT / ping</small><strong>{formatMetric(peer.rttMs, ' ms')}</strong></span>
+                          <span><small>Jitter</small><strong>{formatMetric(peer.jitterMs, ' ms')}</strong></span>
+                          <span><small>Packet loss</small><strong>{formatMetric(peer.packetLossPct, '%', 2)}</strong></span>
+                          <span><small>Upload</small><strong>{formatBitrate(peer.bitrateUpKbps)}</strong></span>
+                          <span><small>Download</small><strong>{formatBitrate(peer.bitrateDownKbps)}</strong></span>
+                          <span><small>Vídeo recebido</small><strong>{videoLabel(peer.receivedVideo)}</strong></span>
+                        </div>
+                        <div className="network-codecs">
+                          <span><small>Codec TX</small><strong>{peer.outboundCodecs.join(', ') || '—'}</strong></span>
+                          <span><small>Codec RX</small><strong>{peer.inboundCodecs.join(', ') || '—'}</strong></span>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+
+              {showLogs && (
                 <section className="technical-drawer">
                   <div className="technical-drawer__header"><strong>Detalhes técnicos</strong><button className="text-button" onClick={() => setShowLogs(false)}>Fechar</button></div>
                   <pre>{technicalLogs.length ? technicalLogs.join('\n') : 'Sem logs ainda.'}</pre>
@@ -604,7 +742,7 @@ function App() {
             <section className="welcome-card">
               <div className="welcome-card__intro">
                 <div className="welcome-logo">D</div>
-                <p className="eyebrow">Discordy Desktop 0.2.1</p>
+                <p className="eyebrow">Discordy Desktop 0.2.3</p>
                 <h1>Sua sala privada, direto entre os participantes.</h1>
                 <p>WebRTC P2P para voz e compartilhamento de tela, com signaling hospedado pelo próprio host.</p>
               </div>

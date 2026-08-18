@@ -1,41 +1,78 @@
-# Discordy Desktop 0.2.1 — UI Foundation
+# Discordy Desktop 0.2.2 — WebRTC Stabilization
 
-Protótipo desktop Electron baseado no WebRTC P2P já validado entre redes diferentes.
+Versão de estabilização da base WebRTC P2P sobre a UI Foundation 0.2.1.
 
+## WebRTC Stabilization 0.2.2
 
-## UI Foundation 0.2.1
+Implementado:
 
-Esta versão estabelece o shell visual base do Discordy antes da estabilização WebRTC:
+- compartilhamento de tela remoto renegociado corretamente;
+- tracks separadas para `microphone`, `camera`, `screenVideo` e `screenAudio`;
+- `Perfect Negotiation` para tratar colisões de ofertas;
+- negociação automática por `negotiationneeded`;
+- fila de ICE candidates enquanto a descrição remota ainda não existe;
+- `restartIce()` automático em `failed`;
+- `restartIce()` após `disconnected` persistente;
+- reconexão automática do WebSocket com backoff;
+- reentrada automática na sala depois da reconexão do signaling;
+- reconstrução das conexões WebRTC quando o signaling recebe uma nova sessão/peer ID;
+- tratamento de `connected`, `disconnected`, `failed` e `closed`;
+- heartbeat WebSocket no signaling server;
+- estado de mídia sinalizado separadamente para microfone, câmera e tela;
+- logs RTC/ICE/SDP/WebSocket disponíveis também para convidados;
+- `RTCPeerConnection` isolado da UI em `src/rtc/PeerManager.ts`.
 
-- rail lateral de salas;
-- sidebar da sala e canal de voz `Geral`;
-- painel de voz conectada;
-- painel do usuário atual;
-- área central de mídia em grid;
-- dock de controles de chamada;
-- sidebar de participantes;
-- convite integrado ao layout;
-- painel técnico em drawer;
-- temas `Dark` e `Onyx`;
-- densidade `Confortável` e `Compacto`;
-- layout responsivo para janelas menores.
+## Fluxo da mídia
 
-A lógica WebRTC/signaling da 0.2.0 foi preservada; a estabilização de negociação, reconexão e screen share remoto fica para a próxima etapa.
+```text
+microphone  ─┐
+camera      ─┼─> PeerManager ─> RTCPeerConnection
+screenVideo ─┤
+screenAudio ─┘
+```
 
-## Objetivo desta versão
+A câmera já possui slot independente na camada RTC, mas a captura/UI de câmera continua reservada para a etapa **Voice & Media**.
 
-Uso normal sem terminal:
+## Recuperação automática
 
-- **Criar sala:** o Electron inicia o signaling local, detecta `cloudflared`, abre um Quick Tunnel e gera um convite.
-- **Entrar na sala:** basta instalar o Discordy e colar/clicar no convite. O convidado não precisa de `cloudflared`.
-- **Mídia:** áudio e compartilhamento de tela continuam WebRTC P2P; Cloudflare transporta apenas HTTP/WebSocket de signaling.
+### WebSocket
+
+```text
+WebSocket perdido
+  -> reconnect 1s
+  -> reconnect 2s
+  -> reconnect 4s
+  -> reconnect 8s
+  -> máximo 10s entre tentativas
+  -> join automático na sala
+  -> recebe novo welcome
+  -> reconstrói peers WebRTC
+```
+
+### WebRTC
+
+```text
+connected
+   ↓
+disconnected
+   ↓ 3.5s sem recuperar
+restartIce()
+
+failed
+   ↓
+restartIce() imediato
+   ↓
+negotiationneeded
+   ↓
+Perfect Negotiation
+```
 
 ## Requisitos para desenvolvimento
 
 - Node.js >= 22.12
 - npm
 - Windows recomendado para o primeiro teste
-- `cloudflared` instalado somente na máquina que for hospedar a sala
+- `cloudflared` instalado somente na máquina que hospeda a sala
 
 ## Desenvolvimento
 
@@ -44,7 +81,7 @@ npm install
 npm run dev
 ```
 
-## Executar como Electron sem servidor Vite
+## Executar como Electron
 
 ```powershell
 npm install
@@ -58,20 +95,17 @@ npm install
 npm run dist:win
 ```
 
-Os instaladores/portables são gerados em `release/`.
+Os artefatos são gerados em `release/`.
 
 ## Fluxo do host
 
 1. Abra o Discordy.
 2. Informe seu nome.
 3. Clique em **Criar uma sala**.
-4. O aplicativo verifica se `cloudflared` existe.
-5. Clique em **Criar sala**.
-6. O app inicia signaling local em uma porta livre.
-7. O app executa automaticamente `cloudflared tunnel --url http://127.0.0.1:<porta>`.
-8. A URL `*.trycloudflare.com` é capturada automaticamente.
-9. O app gera um convite HTTPS normal `https://...trycloudflare.com/join?room=ABC123`.
-10. Clique em **Copiar convite** e envie ao amigo.
+4. O aplicativo verifica `cloudflared`.
+5. Crie a sala.
+6. Copie o convite e envie aos participantes.
+7. Abra **Detalhes técnicos** para acompanhar signaling/RTC quando necessário.
 
 ## Fluxo do convidado
 
@@ -79,33 +113,60 @@ Os instaladores/portables são gerados em `release/`.
 2. Informe seu nome.
 3. Clique em **Entrar em uma sala**.
 4. Cole o convite.
-5. Clique em **Entrar na sala**.
+5. Entre na sala.
 
-Não é necessário Node.js nem `cloudflared` para quem apenas entra usando um aplicativo já empacotado.
+O convidado não precisa instalar `cloudflared`.
 
-## Deep link
+## Diagnóstico 0.2.2
 
-O convite compartilhado é uma URL HTTPS normal. Ao abrir no navegador, uma página mínima do próprio host oferece **Abrir no Discordy**, usando internamente o protocolo:
+Os logs agora identificam a camada:
 
 ```text
-discordy://join?server=https%3A%2F%2Fexample.trycloudflare.com&room=ABC123&v=1
+[HOST] ...
+[WS] ...
+[SERVER] ...
+[RTC abc12345] ...
+[MEDIA] ...
 ```
 
-O mesmo convite HTTPS pode ser colado diretamente no aplicativo.
+Eventos importantes incluem:
 
-## Segurança Electron
-
-- `contextIsolation: true`
-- `nodeIntegration: false`
-- renderer sandboxed
-- operações privilegiadas apenas via `preload` + IPC
-- janela não navega para conteúdo remoto
-- URLs HTTPS externas são abertas no navegador padrão
+```text
+negotiationneeded
+SDP offer enviado
+SDP answer remoto aplicado
+ICE candidate enviado (host/srflx/relay)
+connectionState=connected
+connectionState=disconnected
+ICE restart #1 solicitado
+WebSocket reconectado
+sessão de signaling renovada
+```
 
 ## Limitações atuais
 
-- Quick Tunnel é apropriado para teste/desenvolvimento, não possui garantia de uptime.
-- Sem TURN: algumas combinações de NAT/firewall podem impedir o WebRTC P2P.
+- Sem TURN: algumas combinações de NAT/firewall ainda podem impedir o P2P.
 - Máximo de 4 participantes.
 - Sem autenticação/contas/banco de dados.
-- O protocolo `discordy://` funciona corretamente depois do app ser instalado/registrado no sistema; durante desenvolvimento, pode variar por plataforma.
+- Câmera ainda sem captura/UI, embora a camada RTC já esteja preparada.
+- Quick Tunnel continua sendo a solução temporária de signaling público.
+
+## 0.2.3 — Network Diagnostics
+
+A versão 0.2.3 adiciona diagnóstico WebRTC por peer sem alterar o transporte de mídia:
+
+- `RTCPeerConnection.getStats()`;
+- candidate pair ICE selecionado;
+- tipos `host`, `srflx`, `prflx` e `relay` quando reportados pelo Chromium;
+- classificação automática `P2P direto` ou `TURN Relay`;
+- RTT;
+- jitter;
+- packet loss;
+- bitrate de upload/download calculado por delta de bytes;
+- codecs TX/RX;
+- resolução e FPS do vídeo recebido;
+- estados `connectionState`, `iceConnectionState`, `iceGatheringState` e `signalingState`;
+- teste ativo de conexão com duas amostras;
+- relatório técnico copiável incluindo métricas e logs recentes.
+
+Abra o ícone de atividade ao lado dos logs na seção **Voz conectada**.

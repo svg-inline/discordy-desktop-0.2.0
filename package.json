@@ -1,9 +1,9 @@
 {
   "name": "discordy-desktop",
-  "version": "0.2.1",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
-  "description": "Discordy Desktop - UI Foundation estilo Discord para salas WebRTC P2P auto-hospedadas",
+  "description": "Discordy Desktop - Network Diagnostics WebRTC com ICE route, RTT, jitter, packet loss, bitrate, codecs e vídeo recebido",
   "main": "electron/main.mjs",
   "author": "Discordy",
   "license": "UNLICENSED",
