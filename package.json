@@ -1,9 +1,9 @@
 {
   "name": "discordy-desktop",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "private": true,
   "type": "module",
-  "description": "Discordy Desktop - Security hardening: invite tokens com expiração, rate limiting, validação rígida, proteção anti-spoofing, CSP e IPC/preload endurecidos",
+  "description": "Discordy Desktop - Media stall recovery: screen-share watchdog, stale-track cleanup e recuperação escalonada de vídeo congelado",
   "main": "electron/main.mjs",
   "author": "Discordy",
   "license": "UNLICENSED",

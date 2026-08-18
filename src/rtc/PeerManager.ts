@@ -35,6 +35,9 @@ type PeerState = {
   adaptiveCandidate: AdaptiveQualityLevel;
   adaptiveCandidateCount: number;
   senderPolicyKeys: Partial<Record<keyof SenderSlots, string>>;
+  screenRecoveryAttempts: number;
+  screenRecoveryLastAt: number;
+  screenRecoveryHealthyAt: number;
 };
 
 type PeerManagerOptions = {
@@ -58,6 +61,9 @@ const MAX_CHAT_PACKET_BYTES = 8192;
 const ADAPTIVE_SAMPLE_INTERVAL_MS = 2000;
 const CAMERA_BASELINE_BITRATE_KBPS = 1800;
 const AUDIO_MAX_BITRATE_BPS = 96000;
+const SCREEN_RECOVERY_COOLDOWN_MS = 7000;
+const SCREEN_RECOVERY_ESCALATION_WINDOW_MS = 45000;
+const SCREEN_SENDER_REFRESH_GAP_MS = 120;
 
 type ExtendedEncodingParameters = RTCRtpEncodingParameters & {
   priority?: 'very-low' | 'low' | 'medium' | 'high';
@@ -235,6 +241,9 @@ export class PeerManager {
       adaptiveCandidate: 'excellent',
       adaptiveCandidateCount: 0,
       senderPolicyKeys: {},
+      screenRecoveryAttempts: 0,
+      screenRecoveryLastAt: 0,
+      screenRecoveryHealthyAt: performance.now(),
     };
 
     this.peers.set(info.peerId, state);
@@ -311,6 +320,62 @@ export class PeerManager {
     return count;
   }
 
+  /**
+   * Chamado pelo watchdog do renderer quando uma tela remota deixou de apresentar
+   * frames. A recuperação é deliberadamente escalonada: primeiro pede ao emissor
+   * para reciclar apenas o sender de screen-share; só depois mexe no ICE/peer.
+   */
+  async recoverRemoteScreen(peerId: string, reason = 'renderer-stalled'): Promise<void> {
+    const state = this.peers.get(peerId);
+    if (!state || !state.media.screen || state.pc.signalingState === 'closed') return;
+
+    const now = performance.now();
+    if (now - state.screenRecoveryLastAt < SCREEN_RECOVERY_COOLDOWN_MS) return;
+    if (now - state.screenRecoveryLastAt > SCREEN_RECOVERY_ESCALATION_WINDOW_MS) state.screenRecoveryAttempts = 0;
+
+    state.screenRecoveryLastAt = now;
+    state.screenRecoveryAttempts += 1;
+    const attempt = state.screenRecoveryAttempts;
+    const requestId = crypto.randomUUID();
+    this.log(peerId, `watchdog detectou screen stall; recuperação #${attempt} (${reason})`);
+
+    // Nível 1: mantém a PeerConnection intacta e pede ao broadcaster para
+    // desacoplar/reacoplar somente o RTCRtpSender da tela. O DataChannel costuma
+    // continuar saudável mesmo quando o pipeline de vídeo congela.
+    const refreshPacket = JSON.stringify({
+      type: 'media-recovery',
+      source: 'screen',
+      action: 'refresh-sender',
+      requestId,
+      sentAt: Date.now(),
+    });
+    const refreshRequested = this.sendChatPacket(state, refreshPacket);
+    if (refreshRequested) this.log(peerId, `pedido P2P de refresh do screen sender enviado (${requestId.slice(0, 8)})`);
+
+    if (attempt === 1 && refreshRequested) return;
+
+    // Nível 2: se não existe DataChannel ou o primeiro refresh não resolveu,
+    // força nova negociação ICE. Isso cobre transporte RTP preso com DTLS/SCTP vivo.
+    if (attempt <= 2) {
+      this.restartIce(state, `screen-stall-${attempt}`);
+      return;
+    }
+
+    // Nível 3: recria apenas a conexão deste peer. Sala, signaling e os demais
+    // participantes não são derrubados.
+    this.rebuildPeerConnection(peerId, `screen-stall-${attempt}`);
+  }
+
+  markRemoteScreenHealthy(peerId: string) {
+    const state = this.peers.get(peerId);
+    if (!state) return;
+    state.screenRecoveryHealthyAt = performance.now();
+    if (state.screenRecoveryAttempts > 0) {
+      this.log(peerId, `screen watchdog voltou a receber frames após ${state.screenRecoveryAttempts} tentativa(s)`);
+      this.resetScreenRecoveryState(state, 'frames-resumed');
+    }
+  }
+
   async getDiagnostics(): Promise<PeerDiagnostics[]> {
     const results = await Promise.all([...this.peers.values()].map(async (state) => {
       try {
@@ -343,11 +408,25 @@ export class PeerManager {
     }
 
     if ('media' in data) {
-      state.media[data.media.source] = data.media.active;
-      if (data.media.trackId) state.mediaTrackIds[data.media.source] = data.media.trackId;
-      else if (!data.media.active) delete state.mediaTrackIds[data.media.source];
-      if (data.media.source === 'screen') state.screenShare = data.media.active ? (data.media.screen ?? state.screenShare) : null;
-      this.log(from, `estado remoto ${data.media.source}: ${data.media.active ? 'ativo' : 'inativo'}`);
+      const source = data.media.source;
+      const previousTrackId = state.mediaTrackIds[source];
+      const nextTrackId = data.media.trackId ?? null;
+
+      // Tracks remotas removidas via removeTrack()/replaceTrack() nem sempre disparam
+      // `ended` no receptor. Sem esta limpeza a stream pode manter uma track de tela
+      // antiga e o <video> continuar exibindo o último frame congelado.
+      if (previousTrackId && (!data.media.active || (nextTrackId && nextTrackId !== previousTrackId))) {
+        this.removeRemoteTrackById(state, previousTrackId, `${source}-state-change`);
+      }
+
+      state.media[source] = data.media.active;
+      if (nextTrackId) state.mediaTrackIds[source] = nextTrackId;
+      else if (!data.media.active) delete state.mediaTrackIds[source];
+      if (source === 'screen') {
+        state.screenShare = data.media.active ? (data.media.screen ?? state.screenShare) : null;
+        if (!data.media.active) this.resetScreenRecoveryState(state, 'screen-stopped');
+      }
+      this.log(from, `estado remoto ${source}: ${data.media.active ? 'ativo' : 'inativo'}`);
       this.emitPeers();
       return;
     }
@@ -522,6 +601,14 @@ export class PeerManager {
       return;
     }
 
+    if (value.type === 'media-recovery') {
+      if (value.source !== 'screen' || value.action !== 'refresh-sender') return;
+      if (typeof value.requestId !== 'string' || value.requestId.length < 8 || value.requestId.length > 128) return;
+      this.log(state.info.peerId, `pedido de recuperação da tela recebido (${value.requestId.slice(0, 8)})`);
+      void this.refreshScreenSender(state, value.requestId);
+      return;
+    }
+
     if (value.type !== 'chat-message') return;
     if (typeof value.id !== 'string' || value.id.length < 8 || value.id.length > 128) return;
     if (typeof value.text !== 'string') return;
@@ -678,6 +765,92 @@ export class PeerManager {
     state.senders[slot] = state.pc.addTrack(track, stream);
     void this.applySenderPolicy(state, slot, state.senders[slot]!);
     this.log(state.info.peerId, `${slot} adicionado (${track.kind}/${track.id.slice(0, 8)})`);
+  }
+
+  private removeRemoteTrackById(state: PeerState, trackId: string, reason: string) {
+    const track = state.remoteStream.getTracks().find((candidate) => candidate.id === trackId);
+    if (!track) return;
+    state.remoteStream.removeTrack(track);
+    this.log(state.info.peerId, `track remota antiga removida (${reason}): ${track.kind}/${track.id.slice(0, 8)}`);
+  }
+
+  private async refreshScreenSender(state: PeerState, requestId: string) {
+    const track = this.screenStream?.getVideoTracks()[0] ?? null;
+    if (!track || track.readyState !== 'live' || !this.screenStream) {
+      this.log(state.info.peerId, `refresh ${requestId.slice(0, 8)} ignorado: tela local não está ativa`);
+      this.sendCurrentMediaState(state.info.peerId);
+      return;
+    }
+
+    const sender = state.senders.screenVideo;
+    if (!sender) {
+      this.log(state.info.peerId, `refresh ${requestId.slice(0, 8)}: sender ausente; recriando`);
+      this.syncSender(state, 'screenVideo', track, this.screenStream);
+      this.sendCurrentMediaState(state.info.peerId);
+      return;
+    }
+
+    try {
+      // replaceTrack(null -> track) reinicializa a cadeia do encoder sem trocar a
+      // fonte de captura e, normalmente, sem renegociação SDP.
+      await sender.replaceTrack(null);
+      await new Promise<void>((resolve) => window.setTimeout(resolve, SCREEN_SENDER_REFRESH_GAP_MS));
+      if (state.pc.signalingState === 'closed' || track.readyState !== 'live') return;
+      await sender.replaceTrack(track);
+      delete state.senderPolicyKeys.screenVideo;
+      await this.applySenderPolicy(state, 'screenVideo', sender);
+      this.sendCurrentMediaState(state.info.peerId);
+      this.log(state.info.peerId, `screen sender reciclado com sucesso (${requestId.slice(0, 8)})`);
+    } catch (cause) {
+      this.log(state.info.peerId, `falha reciclando screen sender: ${this.errorMessage(cause)}`);
+      try {
+        state.pc.removeTrack(sender);
+        delete state.senders.screenVideo;
+        delete state.senderPolicyKeys.screenVideo;
+        this.syncSender(state, 'screenVideo', track, this.screenStream);
+        this.sendCurrentMediaState(state.info.peerId);
+      } catch (fallbackCause) {
+        this.log(state.info.peerId, `fallback de recriação do screen sender falhou: ${this.errorMessage(fallbackCause)}`);
+      }
+    }
+  }
+
+  private rebuildPeerConnection(peerId: string, reason: string) {
+    const previous = this.peers.get(peerId);
+    if (!previous) return;
+    const info = { ...previous.info };
+    const remoteMedia = { ...previous.media };
+    const remoteTrackIds = { ...previous.mediaTrackIds };
+    const screenShare = previous.screenShare ? { ...previous.screenShare } : null;
+
+    this.log(peerId, `recriando RTCPeerConnection (${reason})`);
+    this.removePeer(peerId, `rebuild:${reason}`);
+    this.createPeer(info);
+
+    const fresh = this.peers.get(peerId);
+    if (!fresh) return;
+    fresh.media = remoteMedia;
+    fresh.mediaTrackIds = remoteTrackIds;
+    fresh.screenShare = screenShare;
+    fresh.screenRecoveryAttempts = 0;
+    fresh.screenRecoveryLastAt = performance.now();
+    this.emitPeers();
+
+    // Reenvia o estado local depois que os senders foram recriados. A nova offer
+    // é disparada automaticamente por negotiationneeded.
+    window.setTimeout(() => {
+      if (!this.peers.has(peerId)) return;
+      this.sendCurrentMediaState(peerId);
+    }, 250);
+  }
+
+  private resetScreenRecoveryState(state: PeerState, reason: string) {
+    if (state.screenRecoveryAttempts > 0 && reason !== 'frames-resumed') {
+      this.log(state.info.peerId, `estado do screen watchdog resetado (${reason})`);
+    }
+    state.screenRecoveryAttempts = 0;
+    state.screenRecoveryLastAt = 0;
+    state.screenRecoveryHealthyAt = performance.now();
   }
 
   private broadcastMediaState(source: MediaSource, active: boolean, trackId: string | null = null, screen: ScreenShareMetadata | null = null) {

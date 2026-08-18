@@ -1173,3 +1173,16 @@ body {
 @media (max-width: 760px) {
   .adaptive-quality-settings__header { align-items: flex-start; }
 }
+
+/* Media-stall recovery watchdog */
+.screen-share-tile__live--recovering {
+  background: rgba(240, 178, 50, .94);
+  color: #14110a;
+}
+.screen-share-tile__live--recovering span {
+  animation: discordy-recovery-pulse .8s ease-in-out infinite alternate;
+}
+@keyframes discordy-recovery-pulse {
+  from { opacity: .35; transform: scale(.75); }
+  to { opacity: 1; transform: scale(1.15); }
+}

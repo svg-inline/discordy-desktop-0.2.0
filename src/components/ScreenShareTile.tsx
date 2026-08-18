@@ -9,6 +9,8 @@ type Props = {
   local?: boolean;
   expanded?: boolean;
   onToggleExpand?: () => void;
+  onStall?: (details: { noFrameMs: number; trackMuted: boolean }) => void;
+  onRecovered?: () => void;
 };
 
 type VideoWithFrameCallback = HTMLVideoElement & {
@@ -29,6 +31,9 @@ function sourceLabel(type?: ScreenShareMetadata['sourceType']) {
   return 'Tela';
 }
 
+const FRAME_STALL_THRESHOLD_MS = 8000;
+const FRAME_STALL_REPORT_COOLDOWN_MS = 7000;
+
 function formatBitrate(kbps?: number) {
   if (!kbps) return '—';
   return kbps >= 1000 ? `${(kbps / 1000).toFixed(kbps % 1000 === 0 ? 0 : 1)} Mbps` : `${kbps} Kbps`;
@@ -42,20 +47,38 @@ export function ScreenShareTile({
   local = false,
   expanded = false,
   onToggleExpand,
+  onStall,
+  onRecovered,
 }: Props) {
   const videoRef = useRef<VideoWithFrameCallback | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const [fps, setFps] = useState<number | null>(null);
   const [dimensions, setDimensions] = useState<string>('—');
+  const [stalled, setStalled] = useState(false);
+  const lastFrameAtRef = useRef(performance.now());
+  const lastStallReportAtRef = useRef(0);
+  const wasStalledRef = useRef(false);
+  const onStallRef = useRef(onStall);
+  const onRecoveredRef = useRef(onRecovered);
 
-  const track = useMemo(() => selectTrack(stream, trackId), [stream, trackId]);
+  // MediaStream é mutável: ontrack adiciona uma nova track no MESMO objeto.
+  // Não memoizar selectTrack apenas por `stream`/`trackId`, senão um novo
+  // screen-share pode continuar preso na track anterior mesmo após reabrir.
+  const track = selectTrack(stream, trackId);
   const playback = useMemo(() => track ? new MediaStream([track]) : new MediaStream(), [track]);
+
+  useEffect(() => { onStallRef.current = onStall; }, [onStall]);
+  useEffect(() => { onRecoveredRef.current = onRecovered; }, [onRecovered]);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     video.srcObject = playback;
     video.muted = true;
+    lastFrameAtRef.current = performance.now();
+    lastStallReportAtRef.current = 0;
+    wasStalledRef.current = false;
+    setStalled(false);
     void video.play().catch(() => undefined);
   }, [playback]);
 
@@ -97,6 +120,13 @@ export function ScreenShareTile({
     const tick = (now: number) => {
       if (cancelled) return;
       frames += 1;
+      lastFrameAtRef.current = now;
+      if (wasStalledRef.current) {
+        wasStalledRef.current = false;
+        lastStallReportAtRef.current = 0;
+        setStalled(false);
+        onRecoveredRef.current?.();
+      }
       const elapsed = now - startedAt;
       if (elapsed >= 1000) {
         setFps((frames * 1000) / elapsed);
@@ -113,6 +143,41 @@ export function ScreenShareTile({
       if (handle && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(handle);
     };
   }, [playback, track]);
+
+  useEffect(() => {
+    if (!track || track.readyState !== 'live') return;
+    const timer = window.setInterval(() => {
+      const video = videoRef.current;
+      if (!video || document.hidden || typeof video.requestVideoFrameCallback !== 'function') return;
+      const now = performance.now();
+      const noFrameMs = now - lastFrameAtRef.current;
+      if (noFrameMs < FRAME_STALL_THRESHOLD_MS) return;
+
+      if (!wasStalledRef.current) {
+        wasStalledRef.current = true;
+        setStalled(true);
+      }
+
+      // Primeiro repara somente o elemento de reprodução. Isso cobre o caso em
+      // que o decoder/HTMLVideoElement ficou preso apesar da track continuar viva.
+      if (video.srcObject === playback) {
+        video.srcObject = null;
+        queueMicrotask(() => {
+          if (!video.isConnected) return;
+          video.srcObject = playback;
+          video.muted = true;
+          void video.play().catch(() => undefined);
+        });
+      }
+
+      if (!local && onStallRef.current && now - lastStallReportAtRef.current >= FRAME_STALL_REPORT_COOLDOWN_MS) {
+        lastStallReportAtRef.current = now;
+        onStallRef.current({ noFrameMs, trackMuted: track.muted });
+      }
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [local, playback, track]);
 
   const toggleFullscreen = async () => {
     const viewport = viewportRef.current;
@@ -132,7 +197,7 @@ export function ScreenShareTile({
     <article className={`screen-share-tile ${expanded ? 'screen-share-tile--expanded' : ''}`}>
       <div className="screen-share-tile__viewport" ref={viewportRef}>
         <video ref={videoRef} autoPlay muted playsInline />
-        <div className="screen-share-tile__live"><span />AO VIVO</div>
+        <div className={`screen-share-tile__live ${stalled ? 'screen-share-tile__live--recovering' : ''}`}><span />{stalled ? 'RECUPERANDO' : 'AO VIVO'}</div>
         <div className="screen-share-tile__actions">
           {onToggleExpand && <button onClick={onToggleExpand}>{expanded ? 'Reduzir' : 'Expandir'}</button>}
           <button onClick={() => void togglePictureInPicture()}>PiP</button>

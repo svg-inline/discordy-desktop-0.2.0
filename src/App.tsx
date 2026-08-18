@@ -1844,7 +1844,23 @@ function App() {
                     {remoteScreenPeers.map((peer) => {
                       const key = `peer:${peer.peerId}`;
                       if (expandedScreenKey && expandedScreenKey !== key) return null;
-                      return <ScreenShareTile key={key} stream={peer.stream} trackId={peer.mediaTrackIds.screen} broadcasterName={peer.name} metadata={peer.screenShare} expanded={expandedScreenKey === key} onToggleExpand={() => setExpandedScreenKey((current) => current === key ? null : key)} />;
+                      return <ScreenShareTile
+                        key={key}
+                        stream={peer.stream}
+                        trackId={peer.mediaTrackIds.screen}
+                        broadcasterName={peer.name}
+                        metadata={peer.screenShare}
+                        expanded={expandedScreenKey === key}
+                        onToggleExpand={() => setExpandedScreenKey((current) => current === key ? null : key)}
+                        onStall={({ noFrameMs, trackMuted }) => {
+                          appendTechnicalLog(`[SCREEN WATCHDOG] ${peer.name}: sem frame há ${Math.round(noFrameMs)}ms muted=${trackMuted}`);
+                          void peerManagerRef.current?.recoverRemoteScreen(peer.peerId, trackMuted ? 'track-muted' : 'renderer-no-frames');
+                        }}
+                        onRecovered={() => {
+                          appendTechnicalLog(`[SCREEN WATCHDOG] ${peer.name}: frames retomados`);
+                          peerManagerRef.current?.markRemoteScreenHealthy(peer.peerId);
+                        }}
+                      />;
                     })}
                   </div>
                 </section>
